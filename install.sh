@@ -95,8 +95,9 @@ check_local_config() {
 require_tiered_capability() {
     local z=/sys/block/zram0
     [ -d "$z" ] || die "--tiered needs one safe-profile boot first so its kernel support can be proven"
-    [ -e "$z/recomp_algorithm" ] && [ -e "$z/recompress" ] && [ -e "$z/algorithm_params" ] ||
+    if ! { [ -e "$z/recomp_algorithm" ] && [ -e "$z/recompress" ] && [ -e "$z/algorithm_params" ]; }; then
         die "this running kernel does not prove multi-compressor ZRAM support"
+    fi
     grep -qw zstd "$z/comp_algorithm" 2>/dev/null ||
         die "the running zram device does not advertise zstd"
 }

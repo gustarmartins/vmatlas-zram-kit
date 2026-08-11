@@ -8,7 +8,11 @@ WRITEBACK_FILE=/etc/vmatlas-zram/writeback.env
 
 die() { printf 'vmatlas-zram: %s\n' "$*" >&2; exit 2; }
 need_root() { [ "${EUID}" -eq 0 ] || die "this action requires root; rerun with sudo"; }
-node() { [ -r "$1" ] && tr '\0' ' ' <"$1" 2>/dev/null || true; }
+node() {
+    if [ -r "$1" ]; then
+        tr '\0' ' ' <"$1" 2>/dev/null || true
+    fi
+}
 
 env_value() {
     local file=$1 key=$2
@@ -190,11 +194,14 @@ require_writeback() {
     [ -r "$WRITEBACK_FILE" ] || die "writeback was not provisioned by this kit"
     expected=$(env_value "$WRITEBACK_FILE" WRITEBACK_DEVICE)
     actual=$(node "$ZRAM/backing_dev")
-    [ -n "$expected" ] && [ "$actual" != none ] || die "zram has no active backing device"
+    if ! { [ -n "$expected" ] && [ "$actual" != none ]; }; then
+        die "zram has no active backing device"
+    fi
     [ "$(readlink -f -- "$expected")" = "$(readlink -f -- "$actual")" ] ||
         die "active backing device does not match this kit's provisioned device"
-    [ -w "$ZRAM/writeback" ] && [ -w "$ZRAM/writeback_limit" ] && [ -w "$ZRAM/idle" ] ||
+    if ! { [ -w "$ZRAM/writeback" ] && [ -w "$ZRAM/writeback_limit" ] && [ -w "$ZRAM/idle" ]; }; then
         die "kernel writeback or idle-page controls are unavailable"
+    fi
 }
 
 writeback() {
