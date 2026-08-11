@@ -1,0 +1,262 @@
+#!/usr/bin/env bash
+# vmatlas-zram-kit: read-only status plus explicit, capability-gated ZRAM actions.
+set -Eeuo pipefail
+
+ZRAM=/sys/block/zram0
+PROFILE_FILE=/etc/vmatlas-zram/profile.env
+WRITEBACK_FILE=/etc/vmatlas-zram/writeback.env
+
+die() { printf 'vmatlas-zram: %s\n' "$*" >&2; exit 2; }
+need_root() { [ "${EUID}" -eq 0 ] || die "this action requires root; rerun with sudo"; }
+node() { [ -r "$1" ] && tr '\0' ' ' <"$1" 2>/dev/null || true; }
+
+env_value() {
+    local file=$1 key=$2
+    [ -r "$file" ] || return 0
+    awk -F= -v key="$key" '$1 == key {sub(/^[^=]*=/, ""); print; exit}' "$file"
+}
+
+human_bytes() {
+    awk -v n="${1:-0}" 'BEGIN {
+        split("B KiB MiB GiB TiB", units, " ");
+        for (i = 1; i <= 5; i++) {
+            if (n < 1024 || i == 5) { printf "%.1f %s", n, units[i]; exit }
+            n /= 1024
+        }
+    }'
+}
+
+psi_avg10() {
+    local file=$1 kind=$2
+    awk -v kind="$kind" '$1 == kind {
+        for (i = 1; i <= NF; i++) if ($i ~ /^avg10=/) {
+            split($i, value, "="); print value[2]; exit
+        }
+    }' "$file" 2>/dev/null
+}
+
+zram_exists() { [ -d "$ZRAM" ]; }
+
+require_zram() { zram_exists || die "zram0 is not present"; }
+
+lock_action() {
+    exec 9>/run/lock/vmatlas-zram.action.lock
+    flock -n 9 || die "another ZRAM maintenance action is already running"
+}
+
+writeback_written_pages() {
+    local value
+    value=$(awk '{print $3}' "$ZRAM/bd_stat" 2>/dev/null || true)
+    [[ "$value" =~ ^[0-9]+$ ]] || die "cannot read writeback accounting"
+    printf '%s\n' "$value"
+}
+
+writeback_lock() {
+    [ -w "$ZRAM/writeback_limit" ] || return 0
+    printf '0\n' >"$ZRAM/writeback_limit"
+    printf '1\n' >"$ZRAM/writeback_limit_enable"
+}
+
+status() {
+    local mem_total mem_avail mem_some mem_full disk primary secondary mm orig compr used limit bd backing wb_enabled wb_limit ttl enabled
+    mem_total=$(awk '/^MemTotal:/ {print $2 * 1024; exit}' /proc/meminfo)
+    mem_avail=$(awk '/^MemAvailable:/ {print $2 * 1024; exit}' /proc/meminfo)
+    mem_some=$(psi_avg10 /proc/pressure/memory some); mem_some=${mem_some:-unavailable}
+    mem_full=$(psi_avg10 /proc/pressure/memory full); mem_full=${mem_full:-unavailable}
+    printf 'vmatlas-zram status\n'
+    printf '  RAM: %s total, %s available; memory PSI some/full avg10: %s%% / %s%%\n' \
+        "$(human_bytes "$mem_total")" "$(human_bytes "$mem_avail")" "$mem_some" "$mem_full"
+
+    if ! zram_exists; then
+        printf '  ZRAM: unavailable\n'
+        return 0
+    fi
+
+    disk=$(node "$ZRAM/disksize"); disk=${disk:-0}
+    primary=$(node "$ZRAM/comp_algorithm"); primary=${primary//$'\n'/ }
+    secondary=$(node "$ZRAM/recomp_algorithm"); secondary=${secondary//$'\n'/ }
+    mm=$(node "$ZRAM/mm_stat")
+    read -r orig compr used limit _ <<<"$mm" || true
+    orig=${orig:-0}; compr=${compr:-0}; used=${used:-0}; limit=${limit:-0}
+    backing=$(node "$ZRAM/backing_dev"); backing=${backing:-none}
+    printf '  ZRAM: %s virtual; primary: %s\n' "$(human_bytes "$disk")" "$primary"
+    printf '        stored: %s; compressed: %s; RAM used: %s; resident cap: %s\n' \
+        "$(human_bytes "$orig")" "$(human_bytes "$compr")" "$(human_bytes "$used")" "$(human_bytes "$limit")"
+    if [ -n "$secondary" ]; then
+        printf '        secondary: %s\n' "$secondary"
+    else
+        printf '        secondary: unavailable or not configured\n'
+    fi
+
+    if [ "$backing" = none ]; then
+        printf '  Writeback: disabled\n'
+    else
+        bd=$(node "$ZRAM/bd_stat"); wb_enabled=$(node "$ZRAM/writeback_limit_enable"); wb_limit=$(node "$ZRAM/writeback_limit")
+        printf '  Writeback: %s; enforcement=%s; remaining allowance=%s pages; written since reset=%s pages\n' \
+            "$backing" "${wb_enabled:-unknown}" "${wb_limit:-unknown}" "${bd##* }"
+    fi
+
+    printf '  VM: swappiness=%s vfs_cache_pressure=%s page-cluster=%s min_free_kbytes=%s\n' \
+        "$(node /proc/sys/vm/swappiness)" "$(node /proc/sys/vm/vfs_cache_pressure)" \
+        "$(node /proc/sys/vm/page-cluster)" "$(node /proc/sys/vm/min_free_kbytes)"
+    enabled=$(node /sys/kernel/mm/lru_gen/enabled); ttl=$(node /sys/kernel/mm/lru_gen/min_ttl_ms)
+    if [ -n "$enabled" ] || [ -n "$ttl" ]; then
+        printf '  MGLRU: enabled=%s min_ttl_ms=%s\n' "${enabled:-unavailable}" "${ttl:-unavailable}"
+    else
+        printf '  MGLRU: unavailable on this kernel\n'
+    fi
+}
+
+preflight() {
+    local generator zstd multi writeback
+    printf 'vmatlas-zram preflight\n'
+    if [ -d /run/systemd/system ]; then
+        printf '  systemd: present\n'
+    else
+        printf '  systemd: missing (unsupported baseline)\n'
+    fi
+    generator=
+    for generator in /usr/lib/systemd/system-generators/zram-generator /usr/libexec/systemd/system-generators/zram-generator; do
+        [ -x "$generator" ] && break
+        generator=
+    done
+    if [ -n "$generator" ]; then
+        printf '  zram-generator: %s\n' "$($generator --version 2>/dev/null || echo present)"
+    else
+        printf '  zram-generator: missing\n'
+    fi
+    if zram_exists; then
+        zstd=$(node "$ZRAM/comp_algorithm")
+        [ -n "$zstd" ] && printf '  zstd primary support: %s\n' "$(grep -qw zstd <<<"$zstd" && echo yes || echo no)"
+        multi=no
+        [ -e "$ZRAM/recomp_algorithm" ] && [ -e "$ZRAM/recompress" ] && [ -e "$ZRAM/algorithm_params" ] && multi=yes
+        printf '  multi-compressor/recompression ABI: %s\n' "$multi"
+        writeback=no
+        [ -e "$ZRAM/backing_dev" ] && [ -e "$ZRAM/writeback" ] && [ -e "$ZRAM/writeback_limit" ] && writeback=yes
+        printf '  writeback ABI: %s\n' "$writeback"
+    else
+        printf '  zram0: absent; boot the safe profile once before requesting tiered ZRAM\n'
+    fi
+    if [ -r "$PROFILE_FILE" ]; then
+        printf '  installed profile: %s\n' "$(env_value "$PROFILE_FILE" PROFILE)"
+    else
+        printf '  installed profile: none\n'
+    fi
+}
+
+recompress() {
+    local mode=${1:-} request before after
+    need_root
+    require_zram
+    lock_action
+    [ -w "$ZRAM/recompress" ] || die "kernel does not expose recompression"
+    grep -q '#1:' "$ZRAM/recomp_algorithm" 2>/dev/null || die "no secondary ZRAM compressor is configured"
+    case "$mode" in
+        idle)
+            [ -w "$ZRAM/idle" ] || die "kernel does not expose idle-page tracking"
+            printf '3600\n' >"$ZRAM/idle"
+            request='type=idle priority=1'
+            ;;
+        huge-idle)
+            [ -w "$ZRAM/idle" ] || die "kernel does not expose idle-page tracking"
+            printf '3600\n' >"$ZRAM/idle"
+            request='type=huge_idle priority=1'
+            ;;
+        huge) request='type=huge priority=1' ;;
+        all) request='priority=1' ;;
+        *) die 'usage: vmatlas-zram recompress {idle|huge-idle|huge|all}' ;;
+    esac
+    before=$(node "$ZRAM/mm_stat")
+    printf '%s\n' "$request" >"$ZRAM/recompress"
+    after=$(node "$ZRAM/mm_stat")
+    printf 'recompression completed: mode=%s request=%q\n' "$mode" "$request"
+    printf 'mm_stat: %s -> %s\n' "$before" "$after"
+}
+
+require_quiet_pressure() {
+    local mem_some mem_full io_some io_full
+    mem_some=$(psi_avg10 /proc/pressure/memory some); mem_some=${mem_some:-100}
+    mem_full=$(psi_avg10 /proc/pressure/memory full); mem_full=${mem_full:-100}
+    io_some=$(psi_avg10 /proc/pressure/io some); io_some=${io_some:-100}
+    io_full=$(psi_avg10 /proc/pressure/io full); io_full=${io_full:-100}
+    awk -v ms="$mem_some" -v mf="$mem_full" -v is="$io_some" -v ifull="$io_full" \
+        'BEGIN { exit !(ms < 5 && mf < 2 && is < 10 && ifull < 2) }' ||
+        die "pressure is active (memory ${mem_some}%/${mem_full}%, I/O ${io_some}%/${io_full}%); cold writeback is refused"
+}
+
+require_writeback() {
+    local expected actual
+    require_zram
+    [ -r "$WRITEBACK_FILE" ] || die "writeback was not provisioned by this kit"
+    expected=$(env_value "$WRITEBACK_FILE" WRITEBACK_DEVICE)
+    actual=$(node "$ZRAM/backing_dev")
+    [ -n "$expected" ] && [ "$actual" != none ] || die "zram has no active backing device"
+    [ "$(readlink -f -- "$expected")" = "$(readlink -f -- "$actual")" ] ||
+        die "active backing device does not match this kit's provisioned device"
+    [ -w "$ZRAM/writeback" ] && [ -w "$ZRAM/writeback_limit" ] && [ -w "$ZRAM/idle" ] ||
+        die "kernel writeback or idle-page controls are unavailable"
+}
+
+writeback() {
+    local mode=${1:-} confirmation=${2:-} pass_mib cap_mib idle_age written remaining_pages pass_pages before after request_rc=0
+    need_root
+    require_writeback
+    lock_action
+    pass_mib=$(env_value "$WRITEBACK_FILE" COLD_PASS_MIB); pass_mib=${pass_mib:-256}
+    cap_mib=$(env_value "$WRITEBACK_FILE" BOOT_CAP_MIB); cap_mib=${cap_mib:-4096}
+    idle_age=$(env_value "$WRITEBACK_FILE" IDLE_AGE_SECONDS); idle_age=${idle_age:-86400}
+    case "$mode" in
+        cold)
+            require_quiet_pressure
+            ;;
+        emergency)
+            [ "$confirmation" = CONFIRM-EMERGENCY-WRITEBACK ] ||
+                die 'usage: vmatlas-zram writeback emergency CONFIRM-EMERGENCY-WRITEBACK'
+            pass_mib=$(env_value "$WRITEBACK_FILE" EMERGENCY_CAP_MIB); pass_mib=${pass_mib:-1024}
+            ;;
+        *) die 'usage: vmatlas-zram writeback {cold|emergency CONFIRM-EMERGENCY-WRITEBACK}' ;;
+    esac
+    written=$(writeback_written_pages)
+    remaining_pages=$((cap_mib * 1024 * 1024 / 4096 - written))
+    [ "$remaining_pages" -gt 0 ] || die "the ${cap_mib} MiB writeback cap is already reached since this ZRAM reset"
+    pass_pages=$((pass_mib * 1024 * 1024 / 4096))
+    [ "$pass_pages" -le "$remaining_pages" ] || pass_pages=$remaining_pages
+    before=$(node "$ZRAM/bd_stat")
+    trap 'writeback_lock >/dev/null 2>&1 || true' EXIT
+    printf '1\n' >"$ZRAM/writeback_limit_enable"
+    printf '%s\n' "$pass_pages" >"$ZRAM/writeback_limit"
+    if [ "$mode" = cold ]; then
+        printf '%s\n' "$idle_age" >"$ZRAM/idle" || request_rc=$?
+    else
+        printf 'all\n' >"$ZRAM/idle" || request_rc=$?
+    fi
+    [ "$request_rc" -ne 0 ] || printf 'type=idle\n' >"$ZRAM/writeback" || request_rc=$?
+    writeback_lock
+    trap - EXIT
+    after=$(node "$ZRAM/bd_stat")
+    [ "$request_rc" -eq 0 ] || die "writeback request failed; allowance was relocked"
+    printf 'writeback completed: mode=%s; bounded allowance=%s MiB; allowance relocked\n' \
+        "$mode" "$((pass_pages * 4096 / 1024 / 1024))"
+    printf 'bd_stat: %s -> %s\n' "$before" "$after"
+}
+
+usage() {
+    cat <<'EOF'
+usage: vmatlas-zram {status|preflight|recompress MODE|writeback MODE ...}
+
+  status
+  preflight
+  recompress {idle|huge-idle|huge|all}
+  writeback cold
+  writeback emergency CONFIRM-EMERGENCY-WRITEBACK
+EOF
+}
+
+case "${1:-status}" in
+    status) [ "$#" -eq 1 ] || [ "$#" -eq 0 ] || die 'usage: vmatlas-zram status'; status ;;
+    preflight) [ "$#" -eq 1 ] || die 'usage: vmatlas-zram preflight'; preflight ;;
+    recompress) shift; recompress "${1:-}" ;;
+    writeback) shift; writeback "${1:-}" "${2:-}" ;;
+    -h|--help|help) usage ;;
+    *) usage; exit 2 ;;
+esac

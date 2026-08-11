@@ -1,0 +1,11 @@
+[Unit]
+Description=Hourly vmatlas-zram cold-page writeback check
+
+[Timer]
+OnBootSec=30min
+OnUnitActiveSec=1h
+AccuracySec=5min
+RandomizedDelaySec=5min
+
+[Install]
+WantedBy=timers.target

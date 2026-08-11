@@ -1,0 +1,10 @@
+[Unit]
+Description=Guarded vmatlas-zram cold-page writeback pass
+ConditionPathExists=/etc/vmatlas-zram/writeback.env
+
+[Service]
+Type=oneshot
+Nice=15
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+ExecStart=/usr/local/bin/vmatlas-zram writeback cold

@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# vmatlas-zram-kit: applies MGLRU only where the stable ABI exists.
+set -Eeuo pipefail
+
+PROFILE=/etc/vmatlas-zram/profile.env
+ENABLED=/sys/kernel/mm/lru_gen/enabled
+TTL=/sys/kernel/mm/lru_gen/min_ttl_ms
+
+[ "${EUID}" -eq 0 ] || { echo 'vmatlas-zram-mglru: requires root' >&2; exit 2; }
+[ -r "$PROFILE" ] || exit 0
+[ -e "$ENABLED" ] && [ -e "$TTL" ] || exit 0
+
+ttl=$(awk -F= '$1 == "MGLRU_TTL_MS" {print $2; exit}' "$PROFILE")
+[[ "$ttl" =~ ^[0-9]+$ ]] || { echo 'vmatlas-zram-mglru: invalid TTL' >&2; exit 2; }
+
+printf '0x0007\n' >"$ENABLED"
+printf '%s\n' "$ttl" >"$TTL"
+echo "vmatlas-zram MGLRU enabled with min_ttl_ms=$ttl"

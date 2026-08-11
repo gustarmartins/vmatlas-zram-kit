@@ -1,0 +1,13 @@
+[Unit]
+Description=Apply vmatlas-zram MGLRU profile if supported
+After=systemd-zram-setup@zram0.service
+Wants=systemd-zram-setup@zram0.service
+ConditionPathExists=/sys/kernel/mm/lru_gen/enabled
+ConditionPathExists=/sys/kernel/mm/lru_gen/min_ttl_ms
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/vmatlas-zram-mglru
+
+[Install]
+WantedBy=multi-user.target
