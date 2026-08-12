@@ -27,3 +27,13 @@ ZRAM compression algorithms, device size, and backing devices belong to its init
 The source machine has 16 GiB RAM, a Zen kernel, a dedicated raw NVMe partition, and iterative local experiments. Its saved `retained-stability` profile is the baseline, not every live experimental adjustment. The public defaults retain the defensible parts—zstd-first swap, bounded dirty writes, cache retention, and no proactive compaction—then scale RAM-sensitive reservations and dirty caps.
 
 This is why the default does not assume a disk model, a RAM frequency, a GPU, Btrfs, a loop device, or a separate disk swap file.
+
+## Manual actions stay narrow
+
+The optional process helper has three actions: inspect one process, request `MADV_PAGEOUT` for anonymous mappings of one caller-owned process, or fault in only pages that are currently marked swapped for one caller-owned process. It checks PID identity (including start time), user ownership, active swap, RAM headroom, memory PSI, and a portable per-process size ceiling before a normal changing action.
+
+The `--force --confirm-pid PID` form bypasses only RAM/PSI/size gates. It cannot broaden the action beyond that live caller-owned PID. The kit deliberately contains no global `swapoff`, no all-process pageout, and no all-process warm/"unswap" operation. Those are unsafe recovery operations rather than portable profile behavior.
+
+The optional forced writeback command bypasses only the quiet-PSI/cold-age selection, and still requires its exact dedicated raw partition, a literal confirmation, per-run/boot I/O budgets, and allowance relocking. Details are in [OPERATIONS.md](OPERATIONS.md).
+
+Recompression similarly requires quiet memory/I/O PSI by default. Its explicit confirmation bypasses pressure gating only; it cannot bypass missing multi-compressor kernel support.

@@ -25,7 +25,15 @@ vmatlas-zram status
 sudo systemctl enable --now vmatlas-zram-writeback.timer
 ```
 
-An emergency command is deliberately capped at 1 GiB and requires a literal confirmation token. It is not a global `swapoff`, not a full backing-store drain, and does not bypass the dedicated-partition requirement.
+The forced command is deliberately capped at 1 GiB and requires a literal confirmation token:
+
+```bash
+sudo vmatlas-zram writeback force CONFIRM-FORCE-WRITEBACK
+```
+
+It skips the quiet-PSI check and uses `idle=all`, but it still verifies the exact provisioned backing device, observes the 4 GiB boot write-I/O cap, and relocks the allowance afterward. It is not a global `swapoff`, not a full backing-store drain, and does not bypass the dedicated-partition requirement. The legacy `emergency CONFIRM-EMERGENCY-WRITEBACK` spelling is equivalent.
+
+For every manual action, including target-scoped process pageout/warm and the explicit process-gate bypass, see [OPERATIONS.md](OPERATIONS.md).
 
 ## Rollback
 

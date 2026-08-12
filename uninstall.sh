@@ -56,7 +56,7 @@ for target in /etc/systemd/system/vmatlas-zram-mglru.service /etc/systemd/system
     fi
     [ ! -e "$target" ] || note "remove: $target"
 done
-for target in /usr/local/bin/vmatlas-zram /usr/local/libexec/vmatlas-zram-mglru; do
+for target in /usr/local/bin/vmatlas-zram /usr/local/libexec/vmatlas-zram-mglru /usr/local/libexec/vmatlas-zram-process; do
     if [ -f "$target" ] && ! grep -Fqs 'vmatlas-zram-kit' "$target"; then
         die "refusing to remove unrecognized executable: $target"
     fi
@@ -81,7 +81,8 @@ rm -f -- "${targets[@]}" \
     /etc/systemd/system/vmatlas-zram-writeback.service \
     /etc/systemd/system/vmatlas-zram-writeback.timer \
     /usr/local/bin/vmatlas-zram \
-    /usr/local/libexec/vmatlas-zram-mglru
+    /usr/local/libexec/vmatlas-zram-mglru \
+    /usr/local/libexec/vmatlas-zram-process
 rmdir --ignore-fail-on-non-empty /etc/vmatlas-zram \
     /etc/systemd/system/systemd-zram-setup@zram0.service.d \
     /etc/systemd/zram-generator.conf.d 2>/dev/null || true

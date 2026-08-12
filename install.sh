@@ -233,6 +233,7 @@ stage_lines /etc/vmatlas-zram/profile.env 0644 \
     "MGLRU_TTL_MS=$MGLRU_TTL"
 install -D -o root -g root -m 0755 "$SCRIPT_DIR/bin/vmatlas-zram" /usr/local/bin/vmatlas-zram
 install -D -o root -g root -m 0755 "$SCRIPT_DIR/libexec/vmatlas-zram-mglru" /usr/local/libexec/vmatlas-zram-mglru
+install -D -o root -g root -m 0755 "$SCRIPT_DIR/libexec/vmatlas-zram-process" /usr/local/libexec/vmatlas-zram-process
 install -D -o root -g root -m 0644 "$SCRIPT_DIR/systemd/vmatlas-zram-mglru.service" /etc/systemd/system/vmatlas-zram-mglru.service
 
 if [ -n "$WRITEBACK_DEVICE" ]; then

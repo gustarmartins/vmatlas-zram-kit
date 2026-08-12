@@ -5,6 +5,7 @@ set -Eeuo pipefail
 ZRAM=/sys/block/zram0
 PROFILE_FILE=/etc/vmatlas-zram/profile.env
 WRITEBACK_FILE=/etc/vmatlas-zram/writeback.env
+PROCESS_HELPER=/usr/local/libexec/vmatlas-zram-process
 
 die() { printf 'vmatlas-zram: %s\n' "$*" >&2; exit 2; }
 need_root() { [ "${EUID}" -eq 0 ] || die "this action requires root; rerun with sudo"; }
@@ -149,12 +150,20 @@ preflight() {
 }
 
 recompress() {
-    local mode=${1:-} request before after
+    local mode=${1:-} option=${2:-} confirmation=${3:-} request before after
     need_root
     require_zram
     lock_action
     [ -w "$ZRAM/recompress" ] || die "kernel does not expose recompression"
     grep -q '#1:' "$ZRAM/recomp_algorithm" 2>/dev/null || die "no secondary ZRAM compressor is configured"
+    case "$option" in
+        '') require_quiet_pressure recompression ;;
+        --force)
+            [ "$confirmation" = CONFIRM-FORCE-RECOMPRESS ] ||
+                die 'usage: vmatlas-zram recompress MODE --force CONFIRM-FORCE-RECOMPRESS'
+            ;;
+        *) die 'usage: vmatlas-zram recompress MODE [--force CONFIRM-FORCE-RECOMPRESS]' ;;
+    esac
     case "$mode" in
         idle)
             [ -w "$ZRAM/idle" ] || die "kernel does not expose idle-page tracking"
@@ -178,14 +187,14 @@ recompress() {
 }
 
 require_quiet_pressure() {
-    local mem_some mem_full io_some io_full
+    local purpose=${1:-maintenance} mem_some mem_full io_some io_full
     mem_some=$(psi_avg10 /proc/pressure/memory some); mem_some=${mem_some:-100}
     mem_full=$(psi_avg10 /proc/pressure/memory full); mem_full=${mem_full:-100}
     io_some=$(psi_avg10 /proc/pressure/io some); io_some=${io_some:-100}
     io_full=$(psi_avg10 /proc/pressure/io full); io_full=${io_full:-100}
     awk -v ms="$mem_some" -v mf="$mem_full" -v is="$io_some" -v ifull="$io_full" \
         'BEGIN { exit !(ms < 5 && mf < 2 && is < 10 && ifull < 2) }' ||
-        die "pressure is active (memory ${mem_some}%/${mem_full}%, I/O ${io_some}%/${io_full}%); cold writeback is refused"
+        die "pressure is active (memory ${mem_some}%/${mem_full}%, I/O ${io_some}%/${io_full}%); ${purpose} is refused"
 }
 
 require_writeback() {
@@ -214,14 +223,19 @@ writeback() {
     idle_age=$(env_value "$WRITEBACK_FILE" IDLE_AGE_SECONDS); idle_age=${idle_age:-86400}
     case "$mode" in
         cold)
-            require_quiet_pressure
+            require_quiet_pressure 'cold writeback'
             ;;
         emergency)
             [ "$confirmation" = CONFIRM-EMERGENCY-WRITEBACK ] ||
                 die 'usage: vmatlas-zram writeback emergency CONFIRM-EMERGENCY-WRITEBACK'
             pass_mib=$(env_value "$WRITEBACK_FILE" EMERGENCY_CAP_MIB); pass_mib=${pass_mib:-1024}
             ;;
-        *) die 'usage: vmatlas-zram writeback {cold|emergency CONFIRM-EMERGENCY-WRITEBACK}' ;;
+        force)
+            [ "$confirmation" = CONFIRM-FORCE-WRITEBACK ] ||
+                die 'usage: vmatlas-zram writeback force CONFIRM-FORCE-WRITEBACK'
+            pass_mib=$(env_value "$WRITEBACK_FILE" EMERGENCY_CAP_MIB); pass_mib=${pass_mib:-1024}
+            ;;
+        *) die 'usage: vmatlas-zram writeback {cold|force CONFIRM-FORCE-WRITEBACK|emergency CONFIRM-EMERGENCY-WRITEBACK}' ;;
     esac
     written=$(writeback_written_pages)
     remaining_pages=$((cap_mib * 1024 * 1024 / 4096 - written))
@@ -249,21 +263,33 @@ writeback() {
 
 usage() {
     cat <<'EOF'
-usage: vmatlas-zram {status|preflight|recompress MODE|writeback MODE ...}
+usage: vmatlas-zram {status|preflight|recompress MODE|writeback MODE ...|process ACTION PID ...}
 
   status
   preflight
-  recompress {idle|huge-idle|huge|all}
+  recompress {idle|huge-idle|huge|all} [--force CONFIRM-FORCE-RECOMPRESS]
   writeback cold
+  writeback force CONFIRM-FORCE-WRITEBACK
   writeback emergency CONFIRM-EMERGENCY-WRITEBACK
+  process {inspect|pageout|warm} PID [--dry-run|--force --confirm-pid PID]
 EOF
 }
 
 case "${1:-status}" in
     status) [ "$#" -eq 1 ] || [ "$#" -eq 0 ] || die 'usage: vmatlas-zram status'; status ;;
     preflight) [ "$#" -eq 1 ] || die 'usage: vmatlas-zram preflight'; preflight ;;
-    recompress) shift; recompress "${1:-}" ;;
+    recompress)
+        shift
+        [ "$#" -ge 1 ] && [ "$#" -le 3 ] ||
+            die 'usage: vmatlas-zram recompress MODE [--force CONFIRM-FORCE-RECOMPRESS]'
+        recompress "${1:-}" "${2:-}" "${3:-}"
+        ;;
     writeback) shift; writeback "${1:-}" "${2:-}" ;;
+    process)
+        shift
+        [ -x "$PROCESS_HELPER" ] || die "process helper is not installed; reinstall vmatlas-zram-kit"
+        exec "$PROCESS_HELPER" "$@"
+        ;;
     -h|--help|help) usage ;;
     *) usage; exit 2 ;;
 esac
