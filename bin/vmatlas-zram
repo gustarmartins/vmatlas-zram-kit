@@ -280,8 +280,9 @@ case "${1:-status}" in
     preflight) [ "$#" -eq 1 ] || die 'usage: vmatlas-zram preflight'; preflight ;;
     recompress)
         shift
-        [ "$#" -ge 1 ] && [ "$#" -le 3 ] ||
+        if [ "$#" -lt 1 ] || [ "$#" -gt 3 ]; then
             die 'usage: vmatlas-zram recompress MODE [--force CONFIRM-FORCE-RECOMPRESS]'
+        fi
         recompress "${1:-}" "${2:-}" "${3:-}"
         ;;
     writeback) shift; writeback "${1:-}" "${2:-}" ;;
