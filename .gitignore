@@ -2,3 +2,8 @@
 *.tmp
 *.bak
 .DS_Store
+*.qcow2
+*.raw
+*.iso
+tests/vm/.run/
+.run/

@@ -6,7 +6,7 @@ ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 
 for script in install.sh uninstall.sh bin/vmatlas-zram \
               libexec/vmatlas-zram-tier-init libexec/vmatlas-zram-tier-manager \
-              libexec/vmatlas-zram-mglru; do
+              libexec/vmatlas-zram-mglru tests/vm/launch-test-vm.sh; do
     bash -n "$ROOT/$script"
 done
 
