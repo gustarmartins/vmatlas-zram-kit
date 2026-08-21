@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+# vmatlas-zram-tier-init: Pre-initializes multi-tier compression levels and verifies setup
+# Managed by vmatlas-zram-kit
+set -euo pipefail
+
+CONF=/etc/vmatlas-zram/tiers.conf
+FALLBACK_CONF=/etc/vmatlas/zram-tiers.conf
+STATE_DIR=/run/vmatlas-tier
+
+die() { echo "vmatlas-zram-tier-init: $*" >&2; exit 1; }
+
+load_config() {
+    if [ -r "$CONF" ]; then
+        # shellcheck disable=SC1090
+        source "$CONF"
+    elif [ -r "$FALLBACK_CONF" ]; then
+        # shellcheck disable=SC1090
+        source "$FALLBACK_CONF"
+    else
+        die "missing configuration file ($CONF or $FALLBACK_CONF)"
+    fi
+    : "${PRIMARY_ALGO:?}" "${WRITEBACK_ENABLED:?}"
+}
+
+selected() {
+    awk '{for (i=1; i<=NF; i++) if ($i ~ /^\[/ && $i ~ /\]$/) {gsub(/[\[\]]/, "", $i); print $i; exit}}' "$1"
+}
+
+prepare() {
+    local dev=$1 z=/sys/block/$1 prio algo level
+    [ "$dev" = zram0 ] || die "unsupported device $dev (only zram0 supported)"
+    [ -d "$z" ] || die "$z sysfs directory is unavailable"
+    [ "$(cat "$z/initstate")" = 0 ] || die "$dev is already initialized"
+    install -d -m 0755 "$STATE_DIR"
+    rm -f "$STATE_DIR/levels" "$STATE_DIR/prepared"
+
+    # Program primary algorithm
+    printf '%s\n' "$PRIMARY_ALGO" >"$z/comp_algorithm"
+    if [ -n "${PRIMARY_LEVEL:-}" ] && [ -e "$z/algorithm_params" ]; then
+        printf 'algo=%s priority=0 level=%s\n' "$PRIMARY_ALGO" "$PRIMARY_LEVEL" >"$z/algorithm_params"
+    fi
+
+    # Program supplemental recompression tiers through algorithm_params before initialization
+    for prio in 1 2 3; do
+        eval "algo=\${TIER${prio}_ALGO:-}"
+        eval "level=\${TIER${prio}_LEVEL:-}"
+        [ -n "$algo" ] || continue
+        [ -n "$level" ] || die "tier $prio has no compression level defined"
+        if [ -e "$z/recomp_algorithm" ]; then
+            printf 'algo=%s priority=%s\n' "$algo" "$prio" >"$z/recomp_algorithm"
+        fi
+        if [ -e "$z/algorithm_params" ]; then
+            printf 'algo=%s priority=%s level=%s\n' "$algo" "$prio" "$level" >"$z/algorithm_params"
+        fi
+    done
+
+    # Enable compressed writeback if available
+    if [ "${WRITEBACK_ENABLED:-0}" = 1 ] && [ -e "$z/compressed_writeback" ]; then
+        printf 'yes\n' >"$z/compressed_writeback" 2>/dev/null || true
+    fi
+
+    # Generate prepared state receipt
+    {
+        printf 'device=%s\nprimary=%s%s\n' "$dev" "$PRIMARY_ALGO" "${PRIMARY_LEVEL:+:$PRIMARY_LEVEL}"
+        for prio in 1 2 3; do
+            eval "algo=\${TIER${prio}_ALGO:-}"
+            eval "level=\${TIER${prio}_LEVEL:-}"
+            [ -z "$algo" ] || printf 'tier%s=%s:%s\n' "$prio" "$algo" "$level"
+        done
+        printf 'prepared_epoch=%s\n' "$(date +%s)"
+    } >"$STATE_DIR/prepared"
+    chmod 0644 "$STATE_DIR/prepared"
+}
+
+verify() {
+    local dev=$1 z=/sys/block/$1 prio algo line tmp now
+    load_config
+    [ -r "$STATE_DIR/prepared" ] || die "no preparation receipt found in $STATE_DIR/prepared"
+    [ "$(cat "$z/initstate")" = 1 ] || die "$dev did not initialize successfully"
+    [ "$(selected "$z/comp_algorithm")" = "$PRIMARY_ALGO" ] || die "primary algorithm mismatch in $z/comp_algorithm"
+
+    # Verify each secondary tier in recomp_algorithm
+    for prio in 1 2 3; do
+        eval "algo=\${TIER${prio}_ALGO:-}"
+        [ -n "$algo" ] || continue
+        if [ -e "$z/recomp_algorithm" ]; then
+            line=$(tr '\0' '\n' <"$z/recomp_algorithm" | sed -n "/^#${prio}:/p")
+            printf '%s\n' "$line" | grep -q "\[$algo\]" || die "tier $prio algorithm mismatch: expected [$algo], got: $line"
+        fi
+    done
+
+    # Verify writeback backing device and lock limit
+    if [ "${WRITEBACK_ENABLED:-0}" = 1 ]; then
+        if [ -e "$z/backing_dev" ]; then
+            [ "$(cat "$z/backing_dev")" != none ] || die "writeback backing device missing or none"
+        fi
+        if [ -e "$z/writeback_limit" ] && [ -e "$z/writeback_limit_enable" ]; then
+            printf '0\n' >"$z/writeback_limit"
+            printf '1\n' >"$z/writeback_limit_enable"
+        fi
+    fi
+
+    now=$(date +%s)
+    tmp="$STATE_DIR/levels.tmp.$$"
+    {
+        cat "$STATE_DIR/prepared"
+        printf 'verified_epoch=%s\n' "$now"
+        printf 'writeback=%s\n' "${WRITEBACK_ENABLED:-0}"
+    } >"$tmp"
+    chmod 0644 "$tmp"
+    mv -f "$tmp" "$STATE_DIR/levels"
+    rm -f "$STATE_DIR/prepared"
+
+    # Initialize aging timestamps if not already present
+    if [ ! -e "$STATE_DIR/state" ]; then
+        printf 'last_p1_ts=%s\nlast_p2_ts=%s\nlast_p3_ts=%s\nlast_wb_ts=%s\nlast_eval_ts=%s\n' \
+            "$now" "$now" "$now" "$now" "$now" >"$STATE_DIR/state"
+        chmod 0644 "$STATE_DIR/state"
+    fi
+}
+
+clear() {
+    rm -f "$STATE_DIR/levels" "$STATE_DIR/prepared"
+}
+
+load_config
+case "${1:-}" in
+    prepare) prepare "${2:-zram0}" ;;
+    verify) verify "${2:-zram0}" ;;
+    clear) clear ;;
+    *) die "usage: vmatlas-zram-tier-init {prepare|verify|clear} [zram0]" ;;
+esac

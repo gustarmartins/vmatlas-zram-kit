@@ -1,40 +1,69 @@
-# Optional ZRAM writeback
+# ZRAM NVMe Writeback Architecture & Requirements
 
-Writeback is not ordinary disk swap. ZRAM writes selected pages to a block-device backing store while keeping ZRAM as the primary swap device. It is useful only when you deliberately reserve a raw partition for it and understand that writes consume flash endurance and can add I/O latency.
+Writeback in `vmatlas-zram-kit` is an advanced memory demotion mechanism. Rather than exposing an SSD partition as raw system swap (which suffers from high latency and disk fragmentation), ZRAM retains total control of swap allocations in RAM, selectively writing compressed, ancient, or uncompressible pages to a dedicated block device only when resident memory limits are approached.
 
-## Provisioning rule
+---
 
-Pass a stable `/dev/disk/by-*` path to an **empty, unmounted partition used for nothing else**. The installer read-checks partition type, signatures, mounts, and active swap, but it never creates, formats, wipes, shrinks, or chooses a partition.
+## 1. Modern Kernel & GPT Partition Requirements
+
+To prevent system stability issues, the backing partition must adhere to strict Linux storage architecture requirements:
+
+### A. Partition Type GUID: Generic Linux Data (NOT Linux Swap)
+* **Crucial Rule**: The backing partition MUST be typed with the GPT GUID `0fc63daf-8483-4772-8e79-3d69d8477de4` (**Generic Linux Data** / Partition type `8300` in fdisk/sgdisk).
+* **Why**: If the partition is typed as `Linux Swap` (`0657fd6d-a4ab-43c4-84e5-0933c84b4f4f`), the systemd boot generator (`systemd-gpt-auto-generator`) will automatically detect it and create a raw swap unit (e.g. `dev-nvme0n1p1.swap`), activating it directly at priority -1 or -2. This bypasses ZRAM, fights its allocator, and leads to severe swap conflicts.
+* **Installer Automation**: The `install.sh` wizard detects if a selected partition is typed as Linux Swap and provides a safe, automatic option to retype it via `sgdisk` without altering partition boundaries or touching other partitions.
+
+### B. Raw Block Device (No Filesystem or Swap Signatures)
+* The partition must not contain an active filesystem (ext4, btrfs, ntfs) or swap signature.
+* Signatures can be cleared with `wipefs -a /dev/nvme0n1pX`.
+
+### C. Persistent `/dev/disk/by-partuuid/...` Identifier
+* The backing device must always be declared using its persistent PARTUUID path (e.g., `/dev/disk/by-partuuid/01767f33-8e7e-4ef7-ac65-0e63f34836e5`) rather than volatile device names (`/dev/nvme0n1p1` or `/dev/sda1`).
+
+---
+
+## 2. Guarded Writeback & Wear Cap Model
+
+ZRAM writeback writes are strictly bounded by policy to protect SSD flash endurance and avoid I/O stalls:
+
+1. **Compressed Writeback**:
+   Where supported by the kernel (`/sys/block/zram0/compressed_writeback`), pages written to SSD are preserved in compressed form, saving up to 60-70% of write I/O.
+
+2. **Inter-Pass Zero Lock**:
+   Between writeback triggers, `writeback_limit` is explicitly locked to `0` pages with `writeback_limit_enable = 1`. This prevents unsolicited background writes from wearing out flash storage.
+
+3. **Guarded 256 MiB Pass**:
+   When triggered (either manually or adaptively by `vmatlas-zram-tier-manager`), the limit is armed for at most **256 MiB** (65,536 pages). Once the burst completes, the limit is immediately returned to 0 in an exit trap.
+
+4. **Persistent 4 GiB Boot Wear Cap**:
+   A cumulative session counter is maintained in `/run/vmatlas-tier/writeback_pages` that persists across same-boot ZRAM resets, ensuring the device never exceeds the 4 GiB write budget per boot without explicit administrator intervention (`emergency` / `force`).
+
+---
+
+## 3. Automation via Adaptive Tier Manager
+
+`vmatlas-zram-tier-manager` (run every 30 minutes by `vmatlas-zram-tier-manager.timer`) evaluates writeback criteria automatically:
+
+* **GPU Idle Gate**: Only proceeds if GPU busy <= 10%.
+* **I/O Pressure Gate**: Only proceeds if I/O Full PSI `avg10` < 2%.
+* **Resident Ratio Trigger**:
+  * If ZRAM resident memory usage exceeds **85%** of `zram-resident-limit`, a 256 MiB writeback pass is executed.
+  * If ZRAM resident memory usage exceeds **70%** and writeback has been idle for >= 4 hours, a 256 MiB maintenance pass is executed.
+
+---
+
+## 4. Manual Writeback Commands
 
 ```bash
-./install.sh --writeback-device /dev/disk/by-partuuid/REPLACE-ME \
-  --confirm-writeback-device
-```
-
-The partition reference is recorded only in the local `/etc/vmatlas-zram/writeback.env`; it is never part of this repository.
-
-## Budget model
-
-Kernel `writeback_limit` is a remaining count of 4 KiB write-I/O pages, not a data-capacity measure. The kit uses a 256 MiB cold-page allowance per manual/timer pass and a 4 GiB aggregate cap based on `bd_stat` writes since the current ZRAM reset. It then immediately sets the allowance back to zero while keeping enforcement enabled.
-
-The optional timer only considers pages idle for 24 hours, runs no more than hourly, and starts disabled. Enable it only after observing manual runs:
-
-```bash
+# Run standard guarded 256 MiB cold pass
 sudo vmatlas-zram writeback cold
+
+# Writeback huge (uncompressible) pages
+sudo vmatlas-zram writeback huge
+
+# Emergency burst (1024 MiB cap)
+sudo vmatlas-zram writeback emergency
+
+# Inspect live writeback accounting
 vmatlas-zram status
-sudo systemctl enable --now vmatlas-zram-writeback.timer
 ```
-
-The forced command is deliberately capped at 1 GiB and requires a literal confirmation token:
-
-```bash
-sudo vmatlas-zram writeback force CONFIRM-FORCE-WRITEBACK
-```
-
-It skips the quiet-PSI check and uses `idle=all`, but it still verifies the exact provisioned backing device, observes the 4 GiB boot write-I/O cap, and relocks the allowance afterward. It is not a global `swapoff`, not a full backing-store drain, and does not bypass the dedicated-partition requirement. The legacy `emergency CONFIRM-EMERGENCY-WRITEBACK` spelling is equivalent.
-
-For every manual action, including target-scoped process pageout/warm and the explicit process-gate bypass, see [OPERATIONS.md](OPERATIONS.md).
-
-## Rollback
-
-Run `sudo ./uninstall.sh` and reboot when ready. Do not remove or repurpose the backing partition while the current boot still uses it. The uninstaller does not reset live ZRAM or alter active swap.

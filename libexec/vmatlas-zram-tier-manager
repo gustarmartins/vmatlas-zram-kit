@@ -1,0 +1,175 @@
+#!/usr/bin/env bash
+# vmatlas-zram-tier-manager: Periodic background manager for adaptive multi-tier recompression & writeback
+# Managed by vmatlas-zram-kit
+set -euo pipefail
+
+ZRAM=/sys/block/zram0
+STATE_DIR=/run/vmatlas-tier
+STATE_FILE=$STATE_DIR/state
+LEVELS_FILE=$STATE_DIR/levels
+WB_STATE=$STATE_DIR/writeback_pages
+LOCK_FILE=/run/lock/vmatlas-zram-tier.lock
+ACTUATOR=/usr/local/bin/vmatlas-zram
+
+WB_BOOT_MAX_PAGES=$((4 * 1024 * 1024 * 1024 / 4096)) # 4 GiB boot wear cap
+P1_MAX_PAGES=$((256 * 1024 * 1024 / 4096))            # 256 MiB max per pass
+P2_MAX_PAGES=$((128 * 1024 * 1024 / 4096))            # 128 MiB max per pass
+P3_MAX_PAGES=$((64 * 1024 * 1024 / 4096))             # 64 MiB max per pass
+
+die() { echo "vmatlas-zram-tier-manager: $*" >&2; exit 1; }
+
+log_msg() {
+    echo "vmatlas-tier-manager: $*"
+    if command -v systemd-cat >/dev/null 2>&1; then
+        echo "vmatlas-tier-manager: $*" | systemd-cat -t vmatlas-tier -p info 2>/dev/null || true
+    fi
+}
+
+psi() {
+    local file=$1 kind=$2 metric=$3
+    awk -v kind="$kind" -v metric="$metric" '$1 == kind {for(i=1;i<=NF;i++) if($i ~ ("^" metric "=")){split($i,a,"="); print a[2]; exit}}' "$file" 2>/dev/null || echo 0
+}
+
+numeric() { case "$1" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
+
+tier_present() { grep -q "^tier$1=" "$LEVELS_FILE" 2>/dev/null; }
+
+if [ "${1:-}" = status ] || [ "${1:-}" = --status ]; then
+    [ -r "$STATE_FILE" ] && cat "$STATE_FILE" || echo "state=uninitialized"
+    [ -r "$LEVELS_FILE" ] && cat "$LEVELS_FILE" || echo "levels=unverified"
+    exit 0
+fi
+
+[ -z "${1:-}" ] || [ "$1" = run ] || [ "$1" = --run ] || die "usage: vmatlas-zram-tier-manager [run|status]"
+[ "$(id -u)" -eq 0 ] || die "must run as root"
+[ -d "$ZRAM" ] || exit 0
+grep -q '^/dev/zram0[[:space:]]' /proc/swaps || exit 0
+[ -r "$LEVELS_FILE" ] || die "tier levels are not verified for this zram instance (check $LEVELS_FILE)"
+
+install -d -m 0755 "$STATE_DIR"
+
+# Mutex locking with re-entrant support
+if ! { [ "${VMATLAS_LOCK_HELD:-0}" = 1 ] && [ -e /proc/$$/fd/9 ] && [ "$(readlink /proc/$$/fd/9 2>/dev/null)" = "$LOCK_FILE" ]; }; then
+    exec 9>"$LOCK_FILE"
+    flock -n 9 || { log_msg "action=skip reason=another_tier_action_in_progress"; exit 0; }
+fi
+
+read -r z_orig z_compr z_used z_limit _z_peak _z_same _z_compacted z_huge _ <"$ZRAM/mm_stat"
+read -r _z_bd_count _z_bd_reads z_bd_writes <"$ZRAM/bd_stat"
+backing=$(cat "$ZRAM/backing_dev" 2>/dev/null || echo none)
+
+if [ "$z_limit" -eq 0 ]; then
+    mem_total_kib=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)
+    z_limit=$((mem_total_kib * 1024 * 10 / 16))
+fi
+
+resident_ratio=$(awk -v used="$z_used" -v limit="$z_limit" 'BEGIN{if(limit>0) printf "%.4f",used/limit; else print 0}')
+resident_pct=$(awk -v ratio="$resident_ratio" 'BEGIN{printf "%.1f",ratio*100}')
+mem_avail_mib=$(awk '/^MemAvailable:/ {print int($2/1024)}' /proc/meminfo)
+
+# Sample PSI and system load
+mem_full10=$(psi /proc/pressure/memory full avg10)
+cpu_some10=$(psi /proc/pressure/cpu some avg10)
+io_full10=$(psi /proc/pressure/io full avg10)
+loadavg1=$(awk '{print $1}' /proc/loadavg)
+
+# Check GPU busy percent if available (AMD / Intel / generic DRM sysfs)
+gpu_busy=0
+for card_gpu in /sys/class/drm/card*/device/gpu_busy_percent; do
+    if [ -r "$card_gpu" ]; then
+        gpu_val=$(cat "$card_gpu" 2>/dev/null || echo 0)
+        numeric "$gpu_val" && [ "$gpu_val" -gt "$gpu_busy" ] && gpu_busy=$gpu_val
+    fi
+done
+
+now=$(date +%s)
+last_p1_ts=$now; last_p2_ts=$now; last_p3_ts=$now; last_wb_ts=$now
+
+if [ -r "$STATE_FILE" ]; then
+    while IFS='=' read -r key value; do
+        numeric "$value" || continue
+        case "$key" in
+            last_p1_ts) last_p1_ts=$value ;;
+            last_p2_ts) last_p2_ts=$value ;;
+            last_p3_ts) last_p3_ts=$value ;;
+            last_wb_ts) last_wb_ts=$value ;;
+        esac
+    done <"$STATE_FILE"
+fi
+
+cpu_busy=0; cpu_idle=0; mem_stalled=0
+awk -v c="$cpu_some10" -v l="$loadavg1" 'BEGIN{exit !(c>15 || l>4)}' && cpu_busy=1
+awk -v c="$cpu_some10" -v l="$loadavg1" 'BEGIN{exit !(c<5 && l<2)}' && cpu_idle=1
+awk -v m="$mem_full10" 'BEGIN{exit !(m>=2)}' && mem_stalled=1
+
+log_msg "state resident=${resident_pct}% mem_avail=${mem_avail_mib}MiB cpu_psi=${cpu_some10}% mem_full=${mem_full10}% io_full=${io_full10}% load=${loadavg1}"
+
+failures=0
+run_action() {
+    local output
+    if [ -x "$ACTUATOR" ]; then
+        if output=$(VMATLAS_LOCK_HELD=1 "$ACTUATOR" "$@" 2>&1); then
+            log_msg "action=$1 mode=${2:-default} result=ok"
+            return 0
+        fi
+        log_msg "action=$1 mode=${2:-default} result=failed detail=$(printf '%s' "$output" | tr '\n' ' ' | cut -c1-240)"
+        failures=$((failures + 1))
+        return 1
+    fi
+    return 0
+}
+
+# Tier 1 (Priority 1): Pages idle >= 30 mins (1800s). Evaluated every ~30 mins.
+if tier_present 1 && [ $((now - last_p1_ts)) -ge 1800 ]; then
+    if [ "$mem_stalled" -eq 0 ] && awk -v c="$cpu_some10" 'BEGIN{exit !(c<35)}'; then
+        run_action recompress tier1 1 1800 "$P1_MAX_PAGES" && last_p1_ts=$now
+    else
+        log_msg "action=defer tier=1 reason=memory_or_cpu_pressure"
+    fi
+fi
+
+# Tier 2 (Priority 2): Pages idle >= 3 hours (10800s). Evaluated every ~2 hours (7200s).
+if tier_present 2 && [ $((now - last_p2_ts)) -ge 7200 ]; then
+    if [ "$cpu_busy" -eq 0 ] && [ "$mem_stalled" -eq 0 ]; then
+        run_action recompress tier2 2 10800 "$P2_MAX_PAGES" && last_p2_ts=$now
+    else
+        log_msg "action=defer tier=2 reason=memory_or_cpu_pressure"
+    fi
+fi
+
+# Tier 3 (Priority 3): Pages idle >= 12 hours (43200s). Evaluated every ~6 hours (21600s).
+if tier_present 3 && [ $((now - last_p3_ts)) -ge 21600 ]; then
+    if [ "$cpu_idle" -eq 1 ] && [ "$mem_stalled" -eq 0 ]; then
+        run_action recompress tier3 3 43200 "$P3_MAX_PAGES" && last_p3_ts=$now
+    else
+        log_msg "action=defer tier=3 reason=cpu_not_idle"
+    fi
+fi
+
+# Adaptive Writeback to NVMe/SSD Backing Device
+boot_writes=$z_bd_writes
+if [ -r "$WB_STATE" ]; then
+    read -r saved_writes <"$WB_STATE" || saved_writes=0
+    numeric "$saved_writes" && [ "$saved_writes" -gt "$boot_writes" ] && boot_writes=$saved_writes
+fi
+
+if [ "$backing" != none ] && [ "$boot_writes" -lt "$WB_BOOT_MAX_PAGES" ]; then
+    if [ "$gpu_busy" -le 10 ] && awk -v io="$io_full10" 'BEGIN{exit !(io<2)}'; then
+        if awk -v r="$resident_ratio" 'BEGIN{exit !(r>=.85)}'; then
+            mode=cold; [ "$z_huge" -le 0 ] || mode=huge
+            run_action writeback "$mode" && last_wb_ts=$now
+        elif awk -v r="$resident_ratio" 'BEGIN{exit !(r>=.70)}' && [ $((now - last_wb_ts)) -ge 14400 ]; then
+            run_action writeback cold && last_wb_ts=$now
+        fi
+    else
+        log_msg "action=defer writeback reason=gpu_or_io_pressure"
+    fi
+fi
+
+tmp=$STATE_FILE.tmp.$$
+printf 'last_p1_ts=%s\nlast_p2_ts=%s\nlast_p3_ts=%s\nlast_wb_ts=%s\nlast_eval_ts=%s\n' \
+    "$last_p1_ts" "$last_p2_ts" "$last_p3_ts" "$last_wb_ts" "$now" >"$tmp"
+chmod 0644 "$tmp"; mv -f "$tmp" "$STATE_FILE"
+
+log_msg "cycle result=$([ "$failures" -eq 0 ] && echo ok || echo failed)"
+[ "$failures" -eq 0 ]

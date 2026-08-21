@@ -1,5 +1,5 @@
 [Unit]
-Description=Periodic adaptive zram multi-tier recompression and writeback timer (Compatibility Unit)
+Description=Periodic adaptive zram multi-tier recompression and writeback timer
 ConditionPathExists=/sys/block/zram0/recompress
 
 [Timer]

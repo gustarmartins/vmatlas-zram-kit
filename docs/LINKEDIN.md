@@ -1,17 +1,15 @@
-# LinkedIn post draft
+# LinkedIn post
 
-I open-sourced the ZRAM profile kit from my Linux Android-dev workstation: **vmatlas-zram-kit**.
+I put the ZRAM setup from my Linux Android-dev workstation on GitHub: **vmatlas-zram-kit**.
 
-It is for the familiar “everything is active” workload: Android Studio, Gradle daemons, one or more emulators, browsers, Logcat, terminals, and whatever else is open while a build lands.
+It is for the days when Android Studio, Gradle, an emulator, Chrome, Logcat, terminals, and a build all decide they need RAM at the same time.
 
-The project is not a magic-memory script. It is a portable, next-boot profile with visible safety boundaries: it scales RAM-sensitive settings per host, keeps existing disk swap alone, refuses to reset live ZRAM, and makes raw-partition writeback and expensive maintenance actions explicitly opt-in.
+On my 16 GiB-class Linux Zen machine, after two days of uptime, ZRAM was holding 13.87 GiB of logical data in 4.38 GiB of allocator memory. That is 3.17x for that workload. Another 3.79 GiB of older pages sat on a dedicated backing partition.
 
-On my 16 GiB-class Linux Zen source workstation, at a two-day uptime snapshot, ZRAM was representing **13.87 GiB** of logical data in **4.38 GiB** of ZRAM allocator memory: a **3.17x** effective footprint reduction. At the same point, **3.79 GiB** of much colder pages were on a dedicated, budgeted backing partition. That is a real measurement from one workload—not a universal benchmark or a “16 GiB into 1 GiB” claim.
+That is not a “16 GiB in 1 GiB” claim. It is one measured machine under one real workload. Compression depends on the data; latency depends on CPU, RAM, and storage.
 
-The repository also includes optional, inspect-first controls for recompression, bounded cold-page writeback, and single-process pageout/warm. A bypass needs an exact repeated PID or a literal confirmation token; there is intentionally no global `swapoff` or “unswap everything” button.
+The repo stages its changes for the next boot, scales the RAM-dependent values, keeps existing disk swap alone, and makes the expensive stuff optional: tiered recompression, raw-partition writeback, and per-process pageout/warm controls. No live ZRAM reset. No global `swapoff`.
 
-If you develop Android on Linux and regularly ride the edge of RAM without wanting an opaque tuning script, I would love feedback from machines with different CPU, DDR4/DDR5, SSD, and RAM sizes.
+I would love results from other Linux Android-dev machines, especially different RAM sizes, CPUs, and SSDs.
 
-Repository: https://github.com/gustarmartins/vmatlas-zram-kit
-
-Measurement and safety notes: `docs/REAL-WORLD-SNAPSHOT.md` and `docs/OPERATIONS.md`
+https://github.com/gustarmartins/vmatlas-zram-kit

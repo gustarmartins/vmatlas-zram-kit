@@ -1,5 +1,5 @@
 [Unit]
-Description=Adaptive multi-tier zram recompression and writeback manager (Compatibility Unit)
+Description=Adaptive multi-tier zram recompression and writeback manager
 Documentation=https://github.com/gustarmartins/vmatlas-zram-kit
 ConditionPathExists=/run/vmatlas-tier/levels
 After=systemd-zram-setup@zram0.service swap.target

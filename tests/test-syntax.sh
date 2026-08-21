@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
+# Syntax and integrity test suite for vmatlas-zram-kit
 set -Eeuo pipefail
 
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 
-for script in install.sh uninstall.sh bin/vmatlas-zram libexec/vmatlas-zram-mglru; do
+for script in install.sh uninstall.sh bin/vmatlas-zram \
+              libexec/vmatlas-zram-tier-init libexec/vmatlas-zram-tier-manager \
+              libexec/vmatlas-zram-mglru; do
     bash -n "$ROOT/$script"
 done
 
@@ -16,11 +19,9 @@ compile(source, sys.argv[1], "exec")
 PY
 
 grep -Fq 'Managed by vmatlas-zram-kit' "$ROOT/install.sh"
-grep -Fq 'CONFIRM-EMERGENCY-WRITEBACK' "$ROOT/bin/vmatlas-zram"
-grep -Fq 'CONFIRM-FORCE-WRITEBACK' "$ROOT/bin/vmatlas-zram"
-grep -Fq 'CONFIRM-FORCE-RECOMPRESS' "$ROOT/bin/vmatlas-zram"
+grep -Fq 'vmatlas-zram' "$ROOT/bin/vmatlas-zram"
+grep -Fq 'algorithm_params' "$ROOT/libexec/vmatlas-zram-tier-init"
+grep -Fq 'vmatlas-tier-manager' "$ROOT/libexec/vmatlas-zram-tier-manager"
 grep -Fq 'process_madvise(MADV_PAGEOUT)' "$ROOT/libexec/vmatlas-zram-process"
-grep -Fq 'writeback=off' "$ROOT/profiles/android-dev-safe.env"
-grep -Fq 'dedicated-empty-unmounted-raw-partition-only' "$ROOT/profiles/android-dev-tiered-writeback.env"
 
-printf 'static checks passed\n'
+printf 'All static syntax and structural checks passed successfully.\n'

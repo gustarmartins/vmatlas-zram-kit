@@ -1,453 +1,853 @@
 #!/usr/bin/env bash
-# Stage a portable ZRAM profile for the next boot. It deliberately never resets
-# or swaps off the live zram device.
+# ==============================================================================
+# vmatlas-zram-kit: Interactive installer and configuration engine
+# Multi-tier ZRAM, kernel algorithm_params pre-initialization, and guarded NVMe writeback
+# ==============================================================================
 set -Eeuo pipefail
-
-# --- Colors ---
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-BOLD='\033[1m'
-NC='\033[0m'
-
-header() { printf "\n${BLUE}=== %s ===${NC}\n" "$*"; }
-info() { printf "${CYAN}%s${NC}\n" "$*"; }
-success() { printf "${GREEN}✓ %s${NC}\n" "$*"; }
-warn() { printf "${YELLOW}⚠ %s${NC}\n" "$*"; }
-error() { printf "${RED}✗ %s${NC}\n" "$*"; }
-die() { printf "${RED}install.sh: %s${NC}\n" "$*" >&2; exit 2; }
-note() { printf '%s\n' "$*"; }
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 SELF="$SCRIPT_DIR/install.sh"
-PROFILE=android-dev-safe
-TIERED=0
-WRITEBACK_DEVICE=
-CONFIRM_WRITEBACK=0
-ENABLE_COLD_TIMER=0
-ADOPT_LOCAL_CONFIG=0
-APPLY_NOW=0
-DRY_RUN=0
-YES_TO_ALL=0
 ORIGINAL_ARGS=("$@")
 
-usage() {
-    cat <<'EOF'
-usage: ./install.sh [options]
+# Terminal styling & colors
+if [ -t 1 ]; then
+    BOLD=$'\033[1m'
+    DIM=$'\033[2m'
+    BLUE=$'\033[34m'
+    CYAN=$'\033[36m'
+    GREEN=$'\033[32m'
+    YELLOW=$'\033[33m'
+    RED=$'\033[31m'
+    MAGENTA=$'\033[35m'
+    RST=$'\033[0m'
+else
+    BOLD='' DIM='' BLUE='' CYAN='' GREEN='' YELLOW='' RED='' MAGENTA='' RST=''
+fi
 
-Options:
-  --profile android-dev-safe       The default and only baseline profile.
-  --tiered                         Stage zstd level 12 as a secondary compressor.
-  --writeback-device PATH          Dedicated empty raw partition, never a file.
-  --confirm-writeback-device       Required with --writeback-device.
-  --enable-cold-writeback-timer    Enable the optional hourly cold-page timer.
-  --adopt-local-zram-config        Explicitly permit override of local /etc ZRAM config.
-  --apply-now                      Apply the profile immediately instead of waiting for reboot.
-  --dry-run                        Print the plan; do not use sudo or write files.
-  -y, --yes                        Skip prompts (auto-accept).
-  -h, --help                       Show this help.
+# Global defaults
+INTERACTIVE=0
+[ -t 0 ] && [ -t 1 ] && INTERACTIVE=1
+DRY_RUN=0
+ADOPT_LOCAL_CONFIG=0
+LIVE_RESTART=0
+FORCE_RESTART=0
+RETYPE_SWAP=0
+EXPLICIT_INTERACTIVE=0
 
-The resulting ZRAM configuration applies on the next reboot only.
+# Host memory info
+RAM_TOTAL_KIB=$(awk '/^MemTotal:/ {print $2; exit}' /proc/meminfo || echo 16777216)
+RAM_MIB=$((RAM_TOTAL_KIB / 1024))
+RAM_GIB_CALC=$(awk -v k="$RAM_TOTAL_KIB" 'BEGIN{printf "%.1f", k / 1024 / 1024}')
+
+# ZRAM parameters default (Preset 1: Workstation 16GB Baseline)
+ZRAM_SIZE_EXPR="ram * 2.25"
+ZRAM_RESIDENT_LIMIT_EXPR="ram / 1.6"
+SWAP_PRIORITY=90
+
+# Compression Tiering default (4-tier hierarchy)
+TIER_MODE=4 # 4=4-tier (LZ4 -> ZSTD3/9/15), 3=3-tier (LZ4 -> ZSTD3/9), 1=single (ZSTD:3)
+PRIMARY_ALGO="lz4"
+PRIMARY_LEVEL=""
+TIER1_ALGO="zstd"
+TIER1_LEVEL="3"
+TIER2_ALGO="zstd"
+TIER2_LEVEL="9"
+TIER3_ALGO="zstd"
+TIER3_LEVEL="15"
+
+# Writeback defaults
+WRITEBACK_DEVICE=""
+CONFIRM_WRITEBACK=0
+COLD_PASS_MIB=256
+BOOT_CAP_MIB=4096
+EMERGENCY_CAP_MIB=1024
+IDLE_AGE_SECONDS=1800
+
+# VM Sysctl default knobs (16GB baseline)
+SWAPPINESS=142
+VFS_CACHE_PRESSURE=68
+MIN_FREE_KIB=131072
+WATERMARK_SCALE=92
+WATERMARK_BOOST=16155
+PAGE_CLUSTER=0
+COMPACTION_PROACTIVE=0
+COMPACT_UNEVIC=1
+ZONE_RECLAIM=0
+DIRTY_BYTES=1342177280
+DIRTY_BG_BYTES=78643200
+DIRTY_WRITEBACK_CS=150
+DIRTY_EXPIRE_CS=1000
+EXTFRAG_THRESHOLD=250
+MAX_MAP_COUNT=1048576
+MGLRU_TTL=2000
+
+# Helper functions
+info()    { printf "${CYAN}[*] %s${RST}\n" "$*"; }
+success() { printf "${GREEN}[+] %s${RST}\n" "$*"; }
+warn()    { printf "${YELLOW}[!] WARNING: %s${RST}\n" "$*"; }
+err()     { printf "${RED}[-] ERROR: %s${RST}\n" "$*"; }
+die()     { err "$*"; exit 1; }
+step()    { printf "\n${BOLD}${BLUE}>>> %s${RST}\n" "$*"; }
+
+print_banner() {
+    cat <<EOF
+${BOLD}${CYAN}
+================================================================================
+          __     ____  ___ _____ _        _    ____     _____ ____  _     
+          \ \   / /  \/  |_   _/ \      / \  / ___|   |__  /  _ \| \    
+           \ \ / /| |\/| | | |/ _ \    / _ \ \___ \     / /| |_) | |    
+            \ V / | |  | | | / ___ \  / ___ \ ___) |   / /_|  _ <| |___ 
+             \_/  |_|  |_| |/_/   \_\/_/   \_\____/   /____|_| \_\_____|
+================================================================================
+${RST}${DIM}  High-Performance Multi-Tier ZRAM & Linux VM Policy Kit for Modern Workstations${RST}
 EOF
 }
 
+usage() {
+    cat <<EOF
+${BOLD}Usage:${RST} ./install.sh [options]
+
+${BOLD}Installation Modes:${RST}
+  --interactive                  Run full interactive wizard (default in TTY)
+  --non-interactive, -y          Run without interactive prompts using selected options
+  --dry-run                      Print configuration plan without modifying the system
+  --live-restart                 Apply and live-restart ZRAM and VM stack immediately
+  --force-restart                Bypass memory headroom safety check during live restart
+
+${BOLD}ZRAM Sizing Options:${RST}
+  --size <expr>                  ZRAM device size formula (default: "ram * 2.25")
+  --resident-limit <expr>        ZRAM resident memory limit formula (default: "ram / 1.6")
+  --swap-priority <num>          Swap priority in zram-generator (default: 90)
+
+${BOLD}Compression Tiering Options:${RST}
+  --tiers <4|3|1>                Compression pipeline (4=LZ4+ZSTD 3/9/15, 3=LZ4+ZSTD 3/9, 1=ZSTD:3)
+  --primary-algo <algo>          Primary fast swap algorithm (default: lz4)
+  --primary-level <level>        Primary algorithm level (default: empty)
+
+${BOLD}NVMe Writeback Options:${RST}
+  --writeback-device <path>      Dedicated empty raw partition (/dev/disk/by-partuuid/...)
+  --confirm-writeback-device     Explicit confirmation for raw partition usage
+  --retype-swap-partition        Retype partition from Linux Swap to Generic Linux Data
+
+${BOLD}Profile & System Options:${RST}
+  --swappiness <val>             vm.swappiness (default: 142)
+  --vfs-cache-pressure <val>     vm.vfs_cache_pressure (default: 68)
+  --adopt-local-zram-config      Overwrite existing local zram-generator config
+  -h, --help                     Show this help message
+
+EOF
+}
+
+# Parse CLI arguments
 while [ "$#" -gt 0 ]; do
     case "$1" in
-        --profile) PROFILE=${2:-}; shift 2 ;;
-        --tiered) TIERED=1; shift ;;
-        --writeback-device) WRITEBACK_DEVICE=${2:-}; shift 2 ;;
-        --confirm-writeback-device) CONFIRM_WRITEBACK=1; shift ;;
-        --enable-cold-writeback-timer) ENABLE_COLD_TIMER=1; shift ;;
-        --adopt-local-zram-config) ADOPT_LOCAL_CONFIG=1; shift ;;
-        --apply-now) APPLY_NOW=1; shift ;;
+        --interactive) INTERACTIVE=1; EXPLICIT_INTERACTIVE=1; shift ;;
+        --non-interactive|-y|--yes) INTERACTIVE=0; shift ;;
         --dry-run) DRY_RUN=1; shift ;;
-        -y|--yes) YES_TO_ALL=1; shift ;;
+        --live-restart) LIVE_RESTART=1; shift ;;
+        --force-restart) LIVE_RESTART=1; FORCE_RESTART=1; shift ;;
+        --size) ZRAM_SIZE_EXPR="${2:-}"; shift 2 ;;
+        --resident-limit) ZRAM_RESIDENT_LIMIT_EXPR="${2:-}"; shift 2 ;;
+        --swap-priority) SWAP_PRIORITY="${2:-90}"; shift 2 ;;
+        --tiers) TIER_MODE="${2:-4}"; shift 2 ;;
+        --primary-algo) PRIMARY_ALGO="${2:-lz4}"; shift 2 ;;
+        --primary-level) PRIMARY_LEVEL="${2:-}"; shift 2 ;;
+        --writeback-device) WRITEBACK_DEVICE="${2:-}"; shift 2 ;;
+        --confirm-writeback-device) CONFIRM_WRITEBACK=1; shift ;;
+        --retype-swap-partition) RETYPE_SWAP=1; shift ;;
+        --swappiness) SWAPPINESS="${2:-142}"; shift 2 ;;
+        --vfs-cache-pressure) VFS_CACHE_PRESSURE="${2:-68}"; shift 2 ;;
+        --adopt-local-zram-config) ADOPT_LOCAL_CONFIG=1; shift ;;
         -h|--help) usage; exit 0 ;;
-        *) die "unknown option: $1" ;;
+        *) die "unknown option: $1 (see --help)" ;;
     esac
 done
 
-[ "$PROFILE" = android-dev-safe ] || die "only android-dev-safe is currently installable"
-[ "$ENABLE_COLD_TIMER" -eq 0 ] || [ -n "$WRITEBACK_DEVICE" ] || \
-    die "--enable-cold-writeback-timer requires --writeback-device"
-[ -z "$WRITEBACK_DEVICE" ] || [ "$CONFIRM_WRITEBACK" -eq 1 ] || \
-    die "writeback requires --confirm-writeback-device"
+if [ "$DRY_RUN" -eq 1 ] && [ "$EXPLICIT_INTERACTIVE" -eq 0 ]; then
+    INTERACTIVE=0
+fi
 
-ask() {
-    local prompt="$1"
-    local default="${2:-Y}"
-    local ans
+# Detect Linux Distribution
+detect_distro() {
+    DISTRO="unknown"
+    if [ -f /etc/arch-release ] || grep -qi "arch" /etc/os-release 2>/dev/null; then
+        DISTRO="arch"
+    elif [ -f /etc/fedora-release ] || grep -qi "fedora" /etc/os-release 2>/dev/null; then
+        DISTRO="fedora"
+    elif [ -f /etc/debian_version ] || grep -qi "debian\|ubuntu" /etc/os-release 2>/dev/null; then
+        DISTRO="debian"
+    fi
+}
 
-    if [ "$DRY_RUN" -eq 1 ]; then
+# Check and install dependencies
+check_dependencies() {
+    step "Checking System Prerequisites & Package Dependencies"
+    
+    [ -d /run/systemd/system ] || die "systemd is not PID 1. This kit requires a systemd-based Linux system."
+    command -v systemctl >/dev/null 2>&1 || die "systemctl command not found."
+
+    local missing=()
+    command -v awk >/dev/null 2>&1 || missing+=("gawk")
+    command -v lsblk >/dev/null 2>&1 || missing+=("util-linux")
+    command -v sysctl >/dev/null 2>&1 || missing+=("procps-ng")
+    
+    # Check zram-generator
+    local gen_found=0
+    for cand in /usr/lib/systemd/system-generators/zram-generator /usr/libexec/systemd/system-generators/zram-generator; do
+        [ -x "$cand" ] && gen_found=1 && break
+    done
+    if [ "$gen_found" -eq 0 ] && ! command -v zram-generator >/dev/null 2>&1; then
+        missing+=("zram-generator")
+    fi
+
+    if [ "${#missing[@]}" -gt 0 ]; then
+        warn "Missing required packages: ${missing[*]}"
+        if [ "$DISTRO" = "arch" ]; then
+            if [ "$INTERACTIVE" -eq 1 ]; then
+                printf "${BOLD}Install missing packages using pacman now? [Y/n]: ${RST}"
+                read -r reply
+                if [[ ! "$reply" =~ ^[Nn] ]]; then
+                    sudo pacman -S --needed --noconfirm "${missing[@]}" || die "failed to install dependencies with pacman"
+                else
+                    die "required dependencies missing: ${missing[*]}"
+                fi
+            else
+                die "missing dependencies: ${missing[*]}. Please install them first: pacman -S ${missing[*]}"
+            fi
+        else
+            die "please install missing dependencies: ${missing[*]}"
+        fi
+    fi
+    success "All prerequisite packages are installed."
+}
+
+# Inspect kernel capabilities
+check_kernel_capabilities() {
+    step "Inspecting Kernel Multi-Compressor & ZRAM Capabilities"
+    local z=/sys/block/zram0
+
+    # If zram module not loaded, attempt to modprobe it
+    if [ ! -d "$z" ]; then
+        info "Loading zram kernel module for capability probe..."
+        sudo modprobe zram num_devices=1 2>/dev/null || true
+    fi
+
+    local multi_support=0
+    if [ -d "$z" ]; then
+        if [ -e "$z/recomp_algorithm" ] && [ -e "$z/recompress" ] && [ -e "$z/algorithm_params" ]; then
+            multi_support=1
+            success "Kernel multi-compressor recompression ABI verified (recomp_algorithm, algorithm_params, recompress)."
+        else
+            warn "Running kernel lacks multi-compressor ABI (algorithm_params or recomp_algorithm missing)."
+        fi
+
+        if [ -e "$z/compressed_writeback" ]; then
+            success "Kernel compressed writeback ABI verified."
+        fi
+    else
+        info "zram device sysfs not active yet; kernel capabilities will be initialized at boot."
+    fi
+
+    if [ -e /sys/kernel/mm/lru_gen/enabled ]; then
+        success "Multi-Gen LRU (MGLRU) verified."
+    fi
+}
+
+# Auto-scale VM knobs based on host RAM
+autoscale_vm_knobs() {
+    if [ "$RAM_MIB" -le 8192 ]; then
+        MIN_FREE_KIB=65536
+        DIRTY_BG_BYTES=33554432
+        DIRTY_BYTES=268435456
+        MGLRU_TTL=1000
+        SWAPPINESS=140
+    elif [ "$RAM_MIB" -le 24576 ]; then
+        # 16GB Baseline Profile
+        MIN_FREE_KIB=131072
+        DIRTY_BG_BYTES=78643200
+        DIRTY_BYTES=1342177280
+        MGLRU_TTL=2000
+        SWAPPINESS=142
+    elif [ "$RAM_MIB" -le 49152 ]; then
+        # 32GB Profile
+        MIN_FREE_KIB=262144
+        DIRTY_BG_BYTES=134217728
+        DIRTY_BYTES=2684354560
+        MGLRU_TTL=2000
+        SWAPPINESS=140
+    else
+        # 64GB+ Profile
+        MIN_FREE_KIB=524288
+        DIRTY_BG_BYTES=268435456
+        DIRTY_BYTES=5368709120
+        MGLRU_TTL=3000
+        SWAPPINESS=133
+    fi
+}
+
+# Wizard: Sizing Selection
+wizard_sizing() {
+    step "Step 1: ZRAM Sizing & Allocation Strategy"
+    printf "Detected Host RAM: ${BOLD}${GREEN}%s GiB${RST} (${RAM_MIB} MiB)\n\n" "$RAM_GIB_CALC"
+    
+    local s1_size="ram * 2.25"
+    local s1_res="ram / 1.6"
+    local s1_calc_size
+    s1_calc_size=$(awk -v r="$RAM_GIB_CALC" 'BEGIN{printf "%.1f", r * 2.25}')
+    local s1_calc_res
+    s1_calc_res=$(awk -v r="$RAM_GIB_CALC" 'BEGIN{printf "%.1f", r / 1.6}')
+
+    local s2_calc_size
+    s2_calc_size=$(awk -v r="$RAM_GIB_CALC" 'BEGIN{printf "%.1f", r * 2.5}')
+    local s2_calc_res
+    s2_calc_res=$(awk -v r="$RAM_GIB_CALC" 'BEGIN{printf "%.1f", r / 1.5}')
+
+    local s3_calc_size
+    s3_calc_size=$(awk -v r="$RAM_GIB_CALC" 'BEGIN{printf "%.1f", r * 2.0}')
+    local s3_calc_res
+    s3_calc_res=$(awk -v r="$RAM_GIB_CALC" 'BEGIN{printf "%.1f", r / 2.0}')
+
+    cat <<EOF
+Select your ZRAM Sizing Preset:
+  ${BOLD}1) Workstation & Dev Baseline (Recommended for 16GB)${RST}
+     -> ZRAM Size: ${BOLD}${s1_size}${RST} (~${s1_calc_size} GiB virtual) | Resident Limit: ${BOLD}${s1_res}${RST} (~${s1_calc_res} GiB RAM cap)
+  ${BOLD}2) Aggressive / Build Storm (Android / Chromium compiles)${RST}
+     -> ZRAM Size: ${BOLD}ram * 2.50${RST} (~${s2_calc_size} GiB virtual) | Resident Limit: ${BOLD}ram / 1.5${RST} (~${s2_calc_res} GiB RAM cap)
+  ${BOLD}3) Balanced Standard${RST}
+     -> ZRAM Size: ${BOLD}ram * 2.00${RST} (~${s3_calc_size} GiB virtual) | Resident Limit: ${BOLD}ram / 2.0${RST} (~${s3_calc_res} GiB RAM cap)
+  ${BOLD}4) Safe Conservative${RST}
+     -> ZRAM Size: ${BOLD}min(ram * 2, 32 GiB)${RST} | Resident Limit: ${BOLD}ram / 2${RST}
+  ${BOLD}5) Custom Expression${RST}
+     -> Enter custom sizing and resident limit formulas
+EOF
+
+    printf "\n${BOLD}Select option [1-5, Default 1]: ${RST}"
+    read -r choice
+    case "${choice:-1}" in
+        1)
+            ZRAM_SIZE_EXPR="ram * 2.25"
+            ZRAM_RESIDENT_LIMIT_EXPR="ram / 1.6"
+            ;;
+        2)
+            ZRAM_SIZE_EXPR="ram * 2.50"
+            ZRAM_RESIDENT_LIMIT_EXPR="ram / 1.5"
+            ;;
+        3)
+            ZRAM_SIZE_EXPR="ram * 2.00"
+            ZRAM_RESIDENT_LIMIT_EXPR="ram / 2.0"
+            ;;
+        4)
+            ZRAM_SIZE_EXPR="min(ram * 2, 32 * 1024)"
+            ZRAM_RESIDENT_LIMIT_EXPR="ram / 2"
+            ;;
+        5)
+            printf "Enter zram-size formula (e.g. 'ram * 2.25' or '32G'): "
+            read -r ZRAM_SIZE_EXPR
+            printf "Enter zram-resident-limit formula (e.g. 'ram / 1.6' or '10G'): "
+            read -r ZRAM_RESIDENT_LIMIT_EXPR
+            ;;
+        *)
+            ZRAM_SIZE_EXPR="ram * 2.25"
+            ZRAM_RESIDENT_LIMIT_EXPR="ram / 1.6"
+            ;;
+    esac
+    success "Selected ZRAM Sizing: size = '$ZRAM_SIZE_EXPR', resident limit = '$ZRAM_RESIDENT_LIMIT_EXPR'"
+}
+
+# Wizard: Compression Tiering Selection
+wizard_tiering() {
+    step "Step 2: Compression Pipeline & Recompression Tiering"
+    cat <<'EOF'
+Select your Compression Tiering Architecture:
+  1) 4-Stage Progressive Hierarchy (Recommended)
+     -> Primary: LZ4 (instant swap-out latency)
+     -> Tier 1:  ZSTD level 3  (idle ~30 mins, 256 MiB pass)
+     -> Tier 2:  ZSTD level 9  (idle ~3 hours, 128 MiB pass)
+     -> Tier 3:  ZSTD level 15 (idle ~12 hours, 64 MiB pass)
+  2) 3-Stage High-Throughput
+     -> Primary: LZ4
+     -> Tier 1:  ZSTD level 3
+     -> Tier 2:  ZSTD level 9
+  3) Single-Stage ZSTD
+     -> Primary: ZSTD (level 3)
+  4) Custom Tiering Parameters
+EOF
+
+    printf "\nSelect option [1-4, Default 1]: "
+    read -r choice
+    case "${choice:-1}" in
+        1)
+            TIER_MODE=4
+            PRIMARY_ALGO="lz4"
+            PRIMARY_LEVEL=""
+            TIER1_ALGO="zstd"; TIER1_LEVEL="3"
+            TIER2_ALGO="zstd"; TIER2_LEVEL="9"
+            TIER3_ALGO="zstd"; TIER3_LEVEL="15"
+            ;;
+        2)
+            TIER_MODE=3
+            PRIMARY_ALGO="lz4"
+            PRIMARY_LEVEL=""
+            TIER1_ALGO="zstd"; TIER1_LEVEL="3"
+            TIER2_ALGO="zstd"; TIER2_LEVEL="9"
+            TIER3_ALGO=""; TIER3_LEVEL=""
+            ;;
+        3)
+            TIER_MODE=1
+            PRIMARY_ALGO="zstd"
+            PRIMARY_LEVEL="3"
+            TIER1_ALGO=""; TIER1_LEVEL=""
+            TIER2_ALGO=""; TIER2_LEVEL=""
+            TIER3_ALGO=""; TIER3_LEVEL=""
+            ;;
+        4)
+            printf "Enter primary algorithm (e.g. lz4, zstd): "
+            read -r PRIMARY_ALGO
+            printf "Enter primary level (optional, leave empty for default): "
+            read -r PRIMARY_LEVEL
+            printf "Enter Tier 1 algorithm: "
+            read -r TIER1_ALGO
+            printf "Enter Tier 1 level: "
+            read -r TIER1_LEVEL
+            printf "Enter Tier 2 algorithm (or empty): "
+            read -r TIER2_ALGO
+            printf "Enter Tier 2 level (or empty): "
+            read -r TIER2_LEVEL
+            printf "Enter Tier 3 algorithm (or empty): "
+            read -r TIER3_ALGO
+            printf "Enter Tier 3 level (or empty): "
+            read -r TIER3_LEVEL
+            ;;
+        *)
+            TIER_MODE=4
+            PRIMARY_ALGO="lz4"
+            PRIMARY_LEVEL=""
+            TIER1_ALGO="zstd"; TIER1_LEVEL="3"
+            TIER2_ALGO="zstd"; TIER2_LEVEL="9"
+            TIER3_ALGO="zstd"; TIER3_LEVEL="15"
+            ;;
+    esac
+    success "Configured Pipeline: Primary $PRIMARY_ALGO -> Tiers [${TIER1_ALGO:+$TIER1_ALGO:$TIER1_LEVEL} ${TIER2_ALGO:+$TIER2_ALGO:$TIER2_LEVEL} ${TIER3_ALGO:+$TIER3_ALGO:$TIER3_LEVEL}]"
+}
+
+# Wizard: Writeback Partition Configuration
+wizard_writeback() {
+    step "Step 3: NVMe / SSD Writeback Backing Partition"
+    cat <<'EOF'
+ZRAM Writeback allows idle/cold compressed pages to be safely demoted to a dedicated
+raw SSD partition during periods of high resident RAM pressure.
+
+Requirements:
+  - Must be a dedicated RAW partition on an NVMe/SSD.
+  - Must NOT be mounted, active swap, or used for filesystem storage.
+  - MUST have GPT partition type "Generic Linux Data" (0fc63daf-8483-4772-8e79-3d69d8477de4).
+    (If typed as Linux Swap, systemd-gpt-auto-generator will hijack it as ordinary disk swap).
+EOF
+
+    printf "\n${BOLD}Do you want to configure an SSD/NVMe writeback backing partition? [y/N]: ${RST}"
+    read -r enable_wb
+    if [[ ! "$enable_wb" =~ ^[Yy] ]]; then
+        WRITEBACK_DEVICE=""
+        info "Writeback disabled."
         return 0
     fi
 
-    if [ "$YES_TO_ALL" -eq 1 ]; then
-        if [ "$default" = "Y" ]; then
-            success "auto-accepted"
-        else
-            warn "auto-skipped (default N)"
+    printf "\n${CYAN}Scanning available block partitions...${RST}\n"
+    local raw_parts=()
+    local part_uuids=()
+    local part_paths=()
+    local part_types=()
+    local i=1
+
+    while IFS=$'\t' read -r path size type fstype mount partuuid model; do
+        [ "$type" = "part" ] || continue
+        # Filter root / boot
+        [ "$mount" != "/" ] && [ "$mount" != "/boot" ] && [ "$mount" != "/efi" ] || continue
+        [ -n "$partuuid" ] || continue
+
+        local stable_path="/dev/disk/by-partuuid/$partuuid"
+        part_paths+=("$stable_path")
+        part_uuids+=("$partuuid")
+        part_types+=("${fstype:-none}")
+
+        printf "  %2d) %-15s %-8s %-10s mount:%-10s uuid:%s (%s)\n" \
+            "$i" "$path" "$size" "${fstype:-raw}" "${mount:-none}" "$partuuid" "${model:-unknown}"
+        i=$((i + 1))
+    done < <(lsblk -r -n -o PATH,SIZE,TYPE,FSTYPE,MOUNTPOINTS,PARTUUID,MODEL 2>/dev/null || true)
+
+    if [ "${#part_paths[@]}" -eq 0 ]; then
+        warn "No candidate partitions detected automatically."
+        printf "Enter custom persistent path (e.g. /dev/disk/by-partuuid/...) or press Enter to skip: "
+        read -r custom_path
+        if [ -n "$custom_path" ]; then
+            WRITEBACK_DEVICE="$custom_path"
+            CONFIRM_WRITEBACK=1
         fi
-        [ "$default" = "Y" ] && return 0 || return 1
+        return 0
     fi
 
-    if [ "$default" = "Y" ]; then
-        prompt="${prompt} [Y/n] "
-    else
-        prompt="${prompt} [y/N] "
-    fi
-
-    printf "${YELLOW}%s${NC}" "$prompt"
-    read -rp "" ans
-    ans=${ans:-$default}
-
-    case "$ans" in
-        [Yy]* ) return 0 ;;
-        * ) return 1 ;;
+    printf "   0) Enter custom path manually\n"
+    printf "   s) Skip writeback setup\n"
+    printf "\nSelect partition [1-%d, or 0/s]: " "$((i - 1))"
+    read -r sel
+    case "$sel" in
+        [Ss]|"")
+            WRITEBACK_DEVICE=""
+            info "Skipping writeback configuration."
+            return 0
+            ;;
+        0)
+            printf "Enter full /dev/disk/by-* path: "
+            read -r WRITEBACK_DEVICE
+            CONFIRM_WRITEBACK=1
+            ;;
+        *)
+            if [[ "$sel" =~ ^[0-9]+$ ]] && [ "$sel" -ge 1 ] && [ "$sel" -le "${#part_paths[@]}" ]; then
+                local idx=$((sel - 1))
+                WRITEBACK_DEVICE="${part_paths[$idx]}"
+                CONFIRM_WRITEBACK=1
+            else
+                warn "Invalid selection. Skipping writeback."
+                WRITEBACK_DEVICE=""
+                return 0
+            fi
+            ;;
     esac
+
+    # Validate and check GPT partition type
+    if [ -n "$WRITEBACK_DEVICE" ]; then
+        local resolved
+        resolved=$(readlink -f -- "$WRITEBACK_DEVICE" 2>/dev/null || echo "$WRITEBACK_DEVICE")
+        
+        # Check active swap
+        if grep -Fq "$resolved" /proc/swaps 2>/dev/null; then
+            err "$WRITEBACK_DEVICE is currently active as system swap!"
+            printf "Disable active swap on this partition and re-run, or select another partition.\n"
+            WRITEBACK_DEVICE=""
+            return 0
+        fi
+
+        # Check GPT type GUID using sgdisk / lsblk if available
+        local gpt_type=""
+        if command -v sgdisk >/dev/null 2>&1; then
+            local disk_dev
+            disk_dev=$(lsblk -ndo PKNAME "$resolved" 2>/dev/null || true)
+            local part_num
+            part_num=$(lsblk -ndo PARTN "$resolved" 2>/dev/null || true)
+            if [ -n "$disk_dev" ] && [ -n "$part_num" ]; then
+                gpt_type=$(sgdisk -i "$part_num" "/dev/$disk_dev" 2>/dev/null | grep -i "Partition GUID code" | awk '{print $4}' || true)
+            fi
+        fi
+
+        # If typed as Linux swap (0657fd6d-a4ab-43c4-84e5-0933c84b4f4f)
+        if [[ "$gpt_type" =~ ^[0-9a-fA-F-]*0657FD6D ]] || [[ "$gpt_type" =~ ^0657fd6d ]]; then
+            warn "Partition is currently typed as 'Linux swap' ($gpt_type)."
+            printf "systemd-gpt-auto-generator will claim this as ordinary swap at boot, conflicting with ZRAM!\n"
+            printf "${BOLD}Would you like the installer to safely retype it to 'Generic Linux Data' (0fc63daf-8483-4772-8e79-3d69d8477de4)? [Y/n]: ${RST}"
+            read -r retype_ans
+            if [[ ! "$retype_ans" =~ ^[Nn] ]]; then
+                RETYPE_SWAP=1
+            fi
+        fi
+
+        # Check filesystem signatures
+        local sigs
+        sigs=$(wipefs -n --noheadings "$resolved" 2>/dev/null || true)
+        if [ -n "$sigs" ]; then
+            warn "Filesystem signatures detected on $WRITEBACK_DEVICE ($sigs)."
+            printf "${BOLD}Wipe signatures now to prepare as dedicated raw backing store? [y/N]: ${RST}"
+            read -r wipe_ans
+            if [[ "$wipe_ans" =~ ^[Yy] ]]; then
+                sudo wipefs -a "$resolved" || warn "wipefs returned non-zero"
+            else
+                die "cannot use partition with active filesystem signatures."
+            fi
+        fi
+        success "Selected writeback device: $WRITEBACK_DEVICE"
+    fi
 }
 
-generator_path() {
-    local candidate
-    for candidate in \
-        /usr/lib/systemd/system-generators/zram-generator \
-        /usr/libexec/systemd/system-generators/zram-generator; do
-        [ -x "$candidate" ] && { printf '%s\n' "$candidate"; return 0; }
+# Wizard: VM Profile Knobs Selection
+wizard_vm_knobs() {
+    step "Step 4: Linux VM Kernel Tunables (sysctl & MGLRU)"
+    autoscale_vm_knobs
+    cat <<EOF
+Select VM Tunables Baseline:
+  ${BOLD}1) Workstation & Dev Baseline (Codex/AGY default for 16GB)${RST}
+     -> swappiness: ${BOLD}142${RST}, vfs_cache_pressure: ${BOLD}68${RST}, min_free_kbytes: ${BOLD}131072${RST}
+     -> watermarks: scale=${BOLD}92${RST}, boost=${BOLD}16155${RST}, page-cluster: ${BOLD}0${RST} (ZRAM optimized)
+     -> dirty bytes: foreground=${BOLD}1.25 GiB${RST}, background=${BOLD}75 MiB${RST}, MGLRU TTL: ${BOLD}2000ms${RST}
+  ${BOLD}2) Auto-scaled for Host RAM (${RAM_GIB_CALC} GiB)${RST}
+     -> Scaled min_free, dirty ratios, and cache pressure
+  ${BOLD}3) Conservative Default${RST}
+     -> swappiness: 100, vfs_cache_pressure: 100, page-cluster: 0
+EOF
+
+    printf "\nSelect option [1-3, Default 1]: "
+    read -r vm_choice
+    case "${vm_choice:-1}" in
+        1)
+            SWAPPINESS=142
+            VFS_CACHE_PRESSURE=68
+            MIN_FREE_KIB=131072
+            WATERMARK_SCALE=92
+            WATERMARK_BOOST=16155
+            DIRTY_BYTES=1342177280
+            DIRTY_BG_BYTES=78643200
+            MGLRU_TTL=2000
+            ;;
+        2)
+            autoscale_vm_knobs
+            ;;
+        3)
+            SWAPPINESS=100
+            VFS_CACHE_PRESSURE=100
+            PAGE_CLUSTER=0
+            ;;
+        *)
+            SWAPPINESS=142
+            VFS_CACHE_PRESSURE=68
+            ;;
+    esac
+    success "Configured VM Knobs: swappiness=$SWAPPINESS, vfs_cache_pressure=$VFS_CACHE_PRESSURE, page-cluster=0"
+}
+
+# Review Plan and Summary
+show_summary() {
+    step "Configuration Plan & Review"
+    cat <<EOF
+================================================================================
+  Target System:          Linux (${DISTRO}) | ${RAM_GIB_CALC} GiB Total RAM
+--------------------------------------------------------------------------------
+  ZRAM Device (/dev/zram0):
+    Size Expression:      ${BOLD}${ZRAM_SIZE_EXPR}${RST}
+    Resident RAM Limit:   ${BOLD}${ZRAM_RESIDENT_LIMIT_EXPR}${RST}
+    Swap Priority:        ${BOLD}${SWAP_PRIORITY}${RST}
+
+  Compression Hierarchy:
+    Primary Fast Path:    ${BOLD}${PRIMARY_ALGO}${PRIMARY_LEVEL:+ (level $PRIMARY_LEVEL)}${RST}
+    Tier 1 (Priority 1):  ${TIER1_ALGO:+${BOLD}$TIER1_ALGO:$TIER1_LEVEL${RST} (idle ~30m, max 256 MiB)}
+    Tier 2 (Priority 2):  ${TIER2_ALGO:+${BOLD}$TIER2_ALGO:$TIER2_LEVEL${RST} (idle ~3h, max 128 MiB)}
+    Tier 3 (Priority 3):  ${TIER3_ALGO:+${BOLD}$TIER3_ALGO:$TIER3_LEVEL${RST} (idle ~12h, max 64 MiB)}
+
+  NVMe Writeback Backing Store:
+    Backing Device:       ${BOLD}${WRITEBACK_DEVICE:-DISABLED}${RST}
+    Guarded Cold Pass:    ${COLD_PASS_MIB} MiB per burst (auto-relocked to 0 pages)
+    Boot Wear Cap:        ${BOOT_CAP_MIB} MiB persistent budget
+
+  Kernel VM Tunables:
+    vm.swappiness:        ${BOLD}${SWAPPINESS}${RST}
+    vm.vfs_cache_pressure:${BOLD}${VFS_CACHE_PRESSURE}${RST}
+    vm.min_free_kbytes:   ${BOLD}${MIN_FREE_KIB}${RST}
+    vm.page-cluster:      ${BOLD}0${RST} (Zero disk readahead latency)
+    MGLRU TTL:            ${BOLD}${MGLRU_TTL} ms${RST}
+================================================================================
+EOF
+}
+
+# Perform Installation & Staging
+stage_and_install() {
+    step "Staging Configuration Files & Installing System Services"
+
+    # Backup existing configurations
+    local backup_dir="/var/backups/vmatlas-zram-$(date +%Y%m%d-%H%M%S)"
+    sudo install -d -m 0755 "$backup_dir"
+    for f in /etc/systemd/zram-generator.conf \
+             /etc/systemd/zram-generator.conf.d/90-vmatlas-zram.conf \
+             /etc/sysctl.d/90-vmatlas-zram.conf \
+             /etc/vmatlas-zram/tiers.conf \
+             /etc/vmatlas/zram-tiers.conf; do
+        if [ -f "$f" ]; then
+            sudo cp -p "$f" "$backup_dir/" 2>/dev/null || true
+        fi
     done
-    command -v zram-generator 2>/dev/null || return 1
-}
+    info "Backed up existing configuration to $backup_dir"
 
-require_baseline() {
-    [ -d /run/systemd/system ] || die "systemd is not PID 1; this kit needs systemd"
-    command -v systemctl >/dev/null 2>&1 || die "systemctl is required"
-    GENERATOR=$(generator_path) || die "zram-generator is missing; install the distribution package first"
-    [ -x "$GENERATOR" ] || die "zram-generator is not executable"
-}
-
-is_owned_config() {
-    [ -f "$1" ] && grep -Fqs 'Managed by vmatlas-zram-kit' "$1"
-}
-
-check_local_config() {
-    local path
-    [ "$ADOPT_LOCAL_CONFIG" -eq 1 ] && return 0
-    for path in /etc/systemd/zram-generator.conf /run/systemd/zram-generator.conf; do
-        [ ! -e "$path" ] || is_owned_config "$path" ||
-            die "local ZRAM configuration exists at $path; inspect it or rerun with --adopt-local-zram-config"
-    done
-    shopt -s nullglob
-    for path in /etc/systemd/zram-generator.conf.d/*.conf /run/systemd/zram-generator.conf.d/*.conf; do
-        [ "${path##*/}" = 90-vmatlas-zram.conf ] && continue
-        is_owned_config "$path" ||
-            die "local ZRAM configuration exists at $path; inspect it or rerun with --adopt-local-zram-config"
-    done
-    shopt -u nullglob
-}
-
-require_tiered_capability() {
-    local z=/sys/block/zram0
-    [ -d "$z" ] || die "--tiered needs one safe-profile boot first so its kernel support can be proven"
-    if ! { [ -e "$z/recomp_algorithm" ] && [ -e "$z/recompress" ] && [ -e "$z/algorithm_params" ]; }; then
-        die "this running kernel does not prove multi-compressor ZRAM support"
-    fi
-    grep -qw zstd "$z/comp_algorithm" 2>/dev/null ||
-        die "the running zram device does not advertise zstd"
-}
-
-validate_writeback_device() {
-    local resolved type fstype mounts signatures
-    [ -n "$WRITEBACK_DEVICE" ] || return 0
-    resolved=$(readlink -f -- "$WRITEBACK_DEVICE") || die "cannot resolve writeback device: $WRITEBACK_DEVICE"
-    [ -b "$resolved" ] || die "writeback target is not a block device: $WRITEBACK_DEVICE"
-    type=$(lsblk -ndo TYPE "$resolved" 2>/dev/null | head -n1)
-    [ "$type" = part ] || die "writeback target must be a dedicated partition, not $type"
-    fstype=$(lsblk -ndo FSTYPE "$resolved" 2>/dev/null | head -n1 || true)
-    [ -z "$fstype" ] || die "writeback target has filesystem type '$fstype'"
-    mounts=$(lsblk -ndo MOUNTPOINTS "$resolved" 2>/dev/null | tr -d '[:space:]')
-    [ -z "$mounts" ] || die "writeback target is mounted: $mounts"
-    grep -Fq -- "$resolved" /proc/swaps && die "writeback target is active swap"
-    signatures=$(wipefs -n --noheadings "$resolved" 2>/dev/null || true)
-    [ -z "$signatures" ] || die "writeback target has an on-disk signature; do not reuse it"
-    WRITEBACK_DEVICE=$resolved
-}
-
-host_values() {
-    local ram_kib
-    ram_kib=$(awk '/^MemTotal:/ {print $2; exit}' /proc/meminfo)
-    [ -n "$ram_kib" ] || die "cannot read host RAM"
-    if [ "$ram_kib" -le $((8 * 1024 * 1024)) ]; then
-        MIN_FREE_KIB=65536
-        DIRTY_BG=33554432
-        DIRTY=134217728
-        MGLRU_TTL=1000
-    elif [ "$ram_kib" -le $((32 * 1024 * 1024)) ]; then
-        MIN_FREE_KIB=131072
-        DIRTY_BG=67108864
-        DIRTY=268435456
-        MGLRU_TTL=2000
-    else
-        MIN_FREE_KIB=131072
-        DIRTY_BG=134217728
-        DIRTY=536870912
-        MGLRU_TTL=2000
-    fi
-    RAM_MIB=$((ram_kib / 1024))
-}
-
-stage_lines() {
-    local target=$1 mode=$2 temp
-    shift 2
-    temp=$(mktemp)
-    printf '%s\n' "$@" >"$temp"
-    install -D -o root -g root -m "$mode" "$temp" "$target"
-    rm -f -- "$temp"
-}
-
-get_sysctl() {
-    sysctl -n "$1" 2>/dev/null || echo "not set"
-}
-
-# --- Initialization & pre-flight ---
-header "vmatlas-zram-kit installer"
-
-require_baseline
-check_local_config
-[ "$TIERED" -eq 0 ] || require_tiered_capability
-host_values
-
-# Elevate to root before interactive prompts (dry-run stays unprivileged)
-if [ "${EUID}" -ne 0 ] && [ "$DRY_RUN" -eq 0 ]; then
-    info "Requesting root access..."
-    exec sudo -- "$SELF" "${ORIGINAL_ARGS[@]}"
-fi
-
-[ "$DRY_RUN" -eq 1 ] || validate_writeback_device
-
-kernel_ver=$(uname -r)
-info "Host RAM: ${RAM_MIB} MiB"
-info "Kernel: $kernel_ver"
-
-# --- Phase 1: Profile selection ---
-header "Phase 1: Profile Information"
-info "Selected profile: ${BOLD}$PROFILE${NC}"
-info "Computed Host-Scaled Values:"
-info "  min_free_kbytes: $MIN_FREE_KIB"
-info "  dirty_bytes:     $DIRTY"
-info "  MGLRU TTL:       ${MGLRU_TTL}ms"
-
-# --- Variables to track what we will do ---
-DO_ZRAM=0
-DO_SYSCTL=0
-DO_MGLRU=0
-DO_TIERED=0
-DO_WRITEBACK=0
-DO_COLD_TIMER=0
-DO_CLI=0
-
-# --- Phase 2: Step-by-step confirmation ---
-
-header "1. ZRAM Configuration (zram-generator drop-in)"
-current_zram_size=$(zramctl zram0 --output SIZE --noheadings 2>/dev/null || echo "not created")
-current_zram_comp=$(zramctl zram0 --output ALGORITHM --noheadings 2>/dev/null || echo "unknown")
-echo -e "Current state: size=${BOLD}${current_zram_size}${NC} comp=${BOLD}${current_zram_comp}${NC}"
-echo -e "Will set: zram-size=min(ram*2, 32G), cap=ram/2, comp=zstd(3), prio=90"
-if ask "Install ZRAM configuration?" "Y"; then
-    DO_ZRAM=1
-fi
-
-header "2. VM / sysctl tuning"
-current_swappiness=$(get_sysctl vm.swappiness)
-current_vfs=$(get_sysctl vm.vfs_cache_pressure)
-current_page=$(get_sysctl vm.page-cluster)
-echo -e "Current state: swappiness=${BOLD}${current_swappiness}${NC}, vfs_cache_pressure=${BOLD}${current_vfs}${NC}, page-cluster=${BOLD}${current_page}${NC}"
-echo -e "Will set: swappiness=120, vfs_cache_pressure=60, page-cluster=0 + host-scaled dirty/min_free values"
-if ask "Install sysctl tuning?" "Y"; then
-    DO_SYSCTL=1
-fi
-
-header "3. MGLRU (boot service)"
-if [ -f /sys/kernel/mm/lru_gen/enabled ]; then
-    current_mglru=$(cat /sys/kernel/mm/lru_gen/enabled)
-    current_mglru_ttl=$(cat /sys/kernel/mm/lru_gen/min_ttl_ms 2>/dev/null || echo "0")
-    echo -e "Current state: enabled=${BOLD}${current_mglru}${NC}, min_ttl_ms=${BOLD}${current_mglru_ttl}${NC}"
-else
-    echo -e "Current state: ${BOLD}MGLRU not supported by kernel${NC}"
-fi
-echo -e "Will set: enable MGLRU with TTL of ${BOLD}${MGLRU_TTL}ms${NC} on boot"
-if ask "Install MGLRU boot service?" "Y"; then
-    DO_MGLRU=1
-fi
-
-if [ "$TIERED" -eq 1 ]; then
-    header "4. Tiered compression"
-    current_recomp=$(cat /sys/block/zram0/recomp_algorithm 2>/dev/null || echo "not supported/enabled")
-    echo -e "Current state: recomp_algorithm=${BOLD}${current_recomp}${NC}"
-    echo -e "Will set: zstd level 12 secondary compressor"
-    if ask "Install tiered compression?" "Y"; then
-        DO_TIERED=1
-    fi
-fi
-
-if [ -n "$WRITEBACK_DEVICE" ]; then
-    header "5. Writeback device"
-    current_backing=$(cat /sys/block/zram0/backing_dev 2>/dev/null || echo "none")
-    echo -e "Current state: backing_dev=${BOLD}${current_backing}${NC}"
-    echo -e "Will set: Dedicated writeback to ${BOLD}$WRITEBACK_DEVICE${NC}"
-    if ask "Install writeback configuration?" "Y"; then
-        DO_WRITEBACK=1
-    fi
-
-    if [ "$ENABLE_COLD_TIMER" -eq 1 ]; then
-        header "6. Cold writeback timer"
-        echo -e "Current state: N/A"
-        echo -e "Will set: Hourly timer, 24h idle age, 256 MiB passes"
-        if ask "Enable cold writeback timer?" "N"; then
-            DO_COLD_TIMER=1
+    # If partition retyping requested, execute sgdisk
+    if [ "$RETYPE_SWAP" -eq 1 ] && [ -n "$WRITEBACK_DEVICE" ]; then
+        local resolved
+        resolved=$(readlink -f -- "$WRITEBACK_DEVICE")
+        local disk_dev part_num
+        disk_dev=$(lsblk -ndo PKNAME "$resolved" 2>/dev/null || true)
+        part_num=$(lsblk -ndo PARTN "$resolved" 2>/dev/null || true)
+        if [ -n "$disk_dev" ] && [ -n "$part_num" ] && command -v sgdisk >/dev/null 2>&1; then
+            info "Retyping partition $part_num on /dev/$disk_dev to Generic Linux Data..."
+            sudo sgdisk -t "${part_num}:0fc63daf-8483-4772-8e79-3d69d8477de4" "/dev/$disk_dev" || warn "sgdisk retype failed"
+            sudo partprobe "/dev/$disk_dev" 2>/dev/null || true
         fi
     fi
+
+    # Create target directories
+    sudo install -d -m 0755 /etc/systemd/zram-generator.conf.d \
+                            /etc/sysctl.d \
+                            /etc/vmatlas-zram \
+                            /etc/vmatlas \
+                            /etc/systemd/system/systemd-zram-setup@zram0.service.d \
+                            /usr/local/bin \
+                            /usr/local/libexec \
+                            /run/vmatlas-tier
+
+    # 1. Stage /etc/systemd/zram-generator.conf.d/90-vmatlas-zram.conf
+    local zgen_algos="$PRIMARY_ALGO"
+    [ -n "$TIER1_ALGO" ] && zgen_algos="$zgen_algos $TIER1_ALGO"
+    [ -n "$TIER2_ALGO" ] && zgen_algos="$zgen_algos $TIER2_ALGO"
+    [ -n "$TIER3_ALGO" ] && zgen_algos="$zgen_algos $TIER3_ALGO"
+
+    sudo tee /etc/systemd/zram-generator.conf.d/90-vmatlas-zram.conf >/dev/null <<EOF
+# Managed by vmatlas-zram-kit.
+[zram0]
+zram-size = $ZRAM_SIZE_EXPR
+zram-resident-limit = $ZRAM_RESIDENT_LIMIT_EXPR
+compression-algorithm = $zgen_algos
+swap-priority = $SWAP_PRIORITY
+${WRITEBACK_DEVICE:+writeback-device = $WRITEBACK_DEVICE}
+EOF
+    sudo chmod 0644 /etc/systemd/zram-generator.conf.d/90-vmatlas-zram.conf
+
+    # 2. Stage /etc/vmatlas-zram/tiers.conf and /etc/vmatlas/zram-tiers.conf
+    sudo tee /etc/vmatlas-zram/tiers.conf >/dev/null <<EOF
+# Managed by vmatlas-zram-kit.
+PRIMARY_ALGO=$PRIMARY_ALGO
+PRIMARY_LEVEL=$PRIMARY_LEVEL
+TIER1_ALGO=$TIER1_ALGO
+TIER1_LEVEL=$TIER1_LEVEL
+TIER2_ALGO=$TIER2_ALGO
+TIER2_LEVEL=$TIER2_LEVEL
+TIER3_ALGO=$TIER3_ALGO
+TIER3_LEVEL=$TIER3_LEVEL
+WRITEBACK_ENABLED=$([ -n "$WRITEBACK_DEVICE" ] && echo 1 || echo 0)
+EOF
+    sudo chmod 0644 /etc/vmatlas-zram/tiers.conf
+    sudo cp -f /etc/vmatlas-zram/tiers.conf /etc/vmatlas/zram-tiers.conf 2>/dev/null || true
+
+    # 3. Stage /etc/vmatlas-zram/profile.env & writeback.env
+    sudo tee /etc/vmatlas-zram/profile.env >/dev/null <<EOF
+# Managed by vmatlas-zram-kit.
+PROFILE=workstation-tiered
+TIER_MODE=$TIER_MODE
+MGLRU_TTL_MS=$MGLRU_TTL
+EOF
+    sudo chmod 0644 /etc/vmatlas-zram/profile.env
+
+    if [ -n "$WRITEBACK_DEVICE" ]; then
+        sudo tee /etc/vmatlas-zram/writeback.env >/dev/null <<EOF
+# Managed by vmatlas-zram-kit.
+WRITEBACK_DEVICE=$WRITEBACK_DEVICE
+COLD_PASS_MIB=$COLD_PASS_MIB
+BOOT_CAP_MIB=$BOOT_CAP_MIB
+EMERGENCY_CAP_MIB=$EMERGENCY_CAP_MIB
+IDLE_AGE_SECONDS=$IDLE_AGE_SECONDS
+EOF
+        sudo chmod 0644 /etc/vmatlas-zram/writeback.env
+    fi
+
+    # 4. Stage /etc/sysctl.d/90-vmatlas-zram.conf
+    sudo tee /etc/sysctl.d/90-vmatlas-zram.conf >/dev/null <<EOF
+# Managed by vmatlas-zram-kit. Host VM Tunables.
+vm.swappiness = $SWAPPINESS
+vm.vfs_cache_pressure = $VFS_CACHE_PRESSURE
+vm.page-cluster = $PAGE_CLUSTER
+vm.min_free_kbytes = $MIN_FREE_KIB
+vm.watermark_scale_factor = $WATERMARK_SCALE
+vm.watermark_boost_factor = $WATERMARK_BOOST
+vm.zone_reclaim_mode = $ZONE_RECLAIM
+vm.dirty_background_ratio = 0
+vm.dirty_ratio = 0
+vm.dirty_background_bytes = $DIRTY_BG_BYTES
+vm.dirty_bytes = $DIRTY_BYTES
+vm.dirty_expire_centisecs = $DIRTY_EXPIRE_CS
+vm.dirty_writeback_centisecs = $DIRTY_WRITEBACK_CS
+vm.compaction_proactiveness = $COMPACTION_PROACTIVE
+vm.compact_unevictable_allowed = $COMPACT_UNEVIC
+vm.extfrag_threshold = $EXTFRAG_THRESHOLD
+vm.max_map_count = $MAX_MAP_COUNT
+EOF
+    sudo chmod 0644 /etc/sysctl.d/90-vmatlas-zram.conf
+
+    # 5. Install systemd drop-in
+    sudo cp -f "$SCRIPT_DIR/systemd/systemd-zram-setup@zram0.service.d/10-vmatlas-tier.conf" \
+        /etc/systemd/system/systemd-zram-setup@zram0.service.d/10-vmatlas-tier.conf
+    sudo chmod 0644 /etc/systemd/system/systemd-zram-setup@zram0.service.d/10-vmatlas-tier.conf
+
+    # 6. Install binaries and libexec helpers
+    sudo install -D -o root -g root -m 0755 "$SCRIPT_DIR/bin/vmatlas-zram" /usr/local/bin/vmatlas-zram
+    sudo install -D -o root -g root -m 0755 "$SCRIPT_DIR/libexec/vmatlas-zram-tier-init" /usr/local/libexec/vmatlas-zram-tier-init
+    sudo install -D -o root -g root -m 0755 "$SCRIPT_DIR/libexec/vmatlas-zram-tier-manager" /usr/local/libexec/vmatlas-zram-tier-manager
+    sudo install -D -o root -g root -m 0755 "$SCRIPT_DIR/libexec/vmatlas-zram-mglru" /usr/local/libexec/vmatlas-zram-mglru
+    sudo install -D -o root -g root -m 0755 "$SCRIPT_DIR/libexec/vmatlas-zram-process" /usr/local/libexec/vmatlas-zram-process
+
+    # 7. Install systemd unit files
+    sudo install -D -o root -g root -m 0644 "$SCRIPT_DIR/systemd/vmatlas-zram-mglru.service" /etc/systemd/system/vmatlas-zram-mglru.service
+    sudo install -D -o root -g root -m 0644 "$SCRIPT_DIR/systemd/vmatlas-zram-tier-manager.service" /etc/systemd/system/vmatlas-zram-tier-manager.service
+    sudo install -D -o root -g root -m 0644 "$SCRIPT_DIR/systemd/vmatlas-zram-tier-manager.timer" /etc/systemd/system/vmatlas-zram-tier-manager.timer
+
+    # 8. Reload systemd daemon & enable services
+    sudo systemctl daemon-reload
+    sudo systemctl enable vmatlas-zram-mglru.service 2>/dev/null || true
+    sudo systemctl enable vmatlas-zram-tier-manager.timer 2>/dev/null || true
+
+    success "Installation and staging completed successfully!"
+}
+
+# Main Execution Flow
+print_banner
+detect_distro
+check_dependencies
+check_kernel_capabilities
+
+if [ "$INTERACTIVE" -eq 1 ]; then
+    wizard_sizing
+    wizard_tiering
+    wizard_writeback
+    wizard_vm_knobs
+else
+    autoscale_vm_knobs
 fi
 
-header "7. Install CLI tools"
-echo -e "Will install:"
-echo "  - /usr/local/bin/vmatlas-zram"
-echo "  - /usr/local/libexec/vmatlas-zram-mglru"
-echo "  - /usr/local/libexec/vmatlas-zram-process"
-if ask "Install CLI tools and helpers?" "Y"; then
-    DO_CLI=1
-fi
+show_summary
 
 if [ "$DRY_RUN" -eq 1 ]; then
-    header "Dry Run Completed"
-    note "Exiting without applying changes."
+    info "Dry run complete. No modifications were written to disk."
     exit 0
 fi
 
-# --- Phase 3: Execution ---
-header "Phase 3: Execution"
+if [ "$INTERACTIVE" -eq 1 ]; then
+    printf "\n${BOLD}Proceed with installation to system? [Y/n]: ${RST}"
+    read -r proceed_ans
+    if [[ "$proceed_ans" =~ ^[Nn] ]]; then
+        info "Installation cancelled by user."
+        exit 0
+    fi
+fi
 
-if [ "$DO_ZRAM" -eq 1 ] || [ "$DO_TIERED" -eq 1 ] || [ "$DO_WRITEBACK" -eq 1 ]; then
-    zram_lines=(
-        '# Managed by vmatlas-zram-kit. Changes apply on the next boot.'
-        '[zram0]'
-        'zram-size = min(ram * 2, 32 * 1024)'
-        'zram-resident-limit = ram / 2'
-        'swap-priority = 90'
-    )
-    if [ "$DO_TIERED" -eq 1 ]; then
-        zram_lines+=('compression-algorithm = zstd (level=3) zstd (level=12)')
+stage_and_install
+
+# Live restart option
+if [ "$LIVE_RESTART" -eq 1 ] || [ "$INTERACTIVE" -eq 1 ]; then
+    if [ "$LIVE_RESTART" -eq 1 ]; then
+        do_restart=1
     else
-        zram_lines+=('compression-algorithm = zstd (level=3)')
+        printf "\n${BOLD}Would you like to live-rebuild and verify the ZRAM stack immediately without rebooting? [y/N]: ${RST}"
+        read -r restart_ans
+        [[ "$restart_ans" =~ ^[Yy] ]] && do_restart=1 || do_restart=0
     fi
-    [ "$DO_WRITEBACK" -eq 0 ] || zram_lines+=("writeback-device = $WRITEBACK_DEVICE")
-    stage_lines /etc/systemd/zram-generator.conf.d/90-vmatlas-zram.conf 0644 "${zram_lines[@]}"
-    success "Staged ZRAM generator configuration"
-else
-    warn "Skipped ZRAM generator configuration"
-fi
 
-if [ "$DO_SYSCTL" -eq 1 ]; then
-    sysctl_lines=(
-        '# Managed by vmatlas-zram-kit. Host-scaled Android build profile.'
-        'vm.swappiness = 120'
-        'vm.vfs_cache_pressure = 60'
-        'vm.page-cluster = 0'
-        "vm.min_free_kbytes = $MIN_FREE_KIB"
-        'vm.watermark_scale_factor = 100'
-        'vm.watermark_boost_factor = 15000'
-        'vm.zone_reclaim_mode = 0'
-        'vm.dirty_background_ratio = 0'
-        'vm.dirty_ratio = 0'
-        "vm.dirty_background_bytes = $DIRTY_BG"
-        "vm.dirty_bytes = $DIRTY"
-        'vm.dirty_expire_centisecs = 3000'
-        'vm.dirty_writeback_centisecs = 1500'
-        'vm.compaction_proactiveness = 0'
-        'vm.compact_unevictable_allowed = 1'
-        'vm.defrag_mode = 0'
-        'vm.extfrag_threshold = 750'
-        'vm.max_map_count = 1048576'
-    )
-    stage_lines /etc/sysctl.d/90-vmatlas-zram.conf 0644 "${sysctl_lines[@]}"
-    success "Staged sysctl tuning"
-else
-    warn "Skipped sysctl tuning"
-fi
-
-# Always write profile.env since it tracks global state for tools
-if [ "$DO_CLI" -eq 1 ] || [ "$DO_MGLRU" -eq 1 ]; then
-    stage_lines /etc/vmatlas-zram/profile.env 0644 \
-        '# Managed by vmatlas-zram-kit.' \
-        "PROFILE=$PROFILE" \
-        "TIERED=$DO_TIERED" \
-        "MGLRU_TTL_MS=$MGLRU_TTL"
-fi
-
-if [ "$DO_CLI" -eq 1 ]; then
-    install -D -o root -g root -m 0755 "$SCRIPT_DIR/bin/vmatlas-zram" /usr/local/bin/vmatlas-zram
-    install -D -o root -g root -m 0755 "$SCRIPT_DIR/libexec/vmatlas-zram-process" /usr/local/libexec/vmatlas-zram-process
-    success "Installed CLI tools"
-else
-    warn "Skipped CLI tools"
-fi
-
-if [ "$DO_MGLRU" -eq 1 ]; then
-    install -D -o root -g root -m 0755 "$SCRIPT_DIR/libexec/vmatlas-zram-mglru" /usr/local/libexec/vmatlas-zram-mglru
-    install -D -o root -g root -m 0644 "$SCRIPT_DIR/systemd/vmatlas-zram-mglru.service" /etc/systemd/system/vmatlas-zram-mglru.service
-    success "Installed MGLRU boot service"
-else
-    warn "Skipped MGLRU service"
-fi
-
-if [ "$DO_WRITEBACK" -eq 1 ]; then
-    stage_lines /etc/vmatlas-zram/writeback.env 0644 \
-        '# Managed by vmatlas-zram-kit.' \
-        "WRITEBACK_DEVICE=$WRITEBACK_DEVICE" \
-        'COLD_PASS_MIB=256' \
-        'BOOT_CAP_MIB=4096' \
-        'EMERGENCY_CAP_MIB=1024' \
-        'IDLE_AGE_SECONDS=86400'
-    stage_lines /etc/systemd/system/systemd-zram-setup@zram0.service.d/90-vmatlas-zram-writeback.conf 0644 \
-        '[Service]' \
-        "ExecStartPost=/usr/bin/bash -c 'if [ -e /sys/block/%i/compressed_writeback ]; then echo yes > /sys/block/%i/compressed_writeback; fi'" \
-        "ExecStartPost=/usr/bin/bash -c 'if [ -e /sys/block/%i/writeback_limit ]; then echo 0 > /sys/block/%i/writeback_limit; echo 1 > /sys/block/%i/writeback_limit_enable; fi'"
-    install -D -o root -g root -m 0644 "$SCRIPT_DIR/systemd/vmatlas-zram-writeback.service" /etc/systemd/system/vmatlas-zram-writeback.service
-    install -D -o root -g root -m 0644 "$SCRIPT_DIR/systemd/vmatlas-zram-writeback.timer" /etc/systemd/system/vmatlas-zram-writeback.timer
-    success "Installed writeback configuration"
-else
-    if [ -n "$WRITEBACK_DEVICE" ]; then
-        warn "Skipped writeback configuration"
-    fi
-fi
-
-if [ "$DO_COLD_TIMER" -eq 1 ]; then
-    success "Enabled cold writeback timer"
-else
-    if [ -n "$WRITEBACK_DEVICE" ] && [ "$ENABLE_COLD_TIMER" -eq 1 ]; then
-        warn "Skipped cold writeback timer"
-    fi
-fi
-
-# Consolidate daemon-reload and service enablement
-systemctl daemon-reload
-[ "$DO_MGLRU" -eq 0 ] || systemctl enable vmatlas-zram-mglru.service >/dev/null
-[ "$DO_COLD_TIMER" -eq 0 ] || systemctl enable vmatlas-zram-writeback.timer >/dev/null
-
-# --- Phase 4: Apply or stage ---
-header "Summary"
-
-if [ "$APPLY_NOW" -eq 1 ]; then
-    info 'Applying changes live...'
-    [ "$DO_SYSCTL" -eq 0 ] || sysctl --system >/dev/null 2>&1 || warn 'sysctl apply failed'
-    [ "$DO_MGLRU" -eq 0 ] || systemctl start vmatlas-zram-mglru.service 2>/dev/null || true
-    if [ "$DO_ZRAM" -eq 1 ] || [ "$DO_TIERED" -eq 1 ] || [ "$DO_WRITEBACK" -eq 1 ]; then
-        if systemctl list-unit-files 'systemd-zram-setup@.service' >/dev/null 2>&1; then
-            systemctl restart systemd-zram-setup@zram0.service 2>/dev/null || true
+    if [ "${do_restart:-0}" -eq 1 ]; then
+        info "Executing live restart via 'vmatlas-zram restart'..."
+        if [ "$FORCE_RESTART" -eq 1 ]; then
+            sudo /usr/local/bin/vmatlas-zram restart --force
+        else
+            sudo /usr/local/bin/vmatlas-zram restart
         fi
+        success "Live restart and verification complete!"
+        sudo /usr/local/bin/vmatlas-zram status
+        exit 0
     fi
-    success 'Profile applied live. Run: vmatlas-zram status'
-else
-    success 'Staged for next reboot. Live ZRAM untouched.'
-    info 'Reboot when ready, then run: vmatlas-zram status'
 fi
+
+printf "\n${GREEN}${BOLD}Setup completed successfully!${RST}\n"
+printf "Configuration will automatically take effect on the next boot.\n"
+printf "To inspect or manage your ZRAM stack at any time, run:\n"
+printf "  ${BOLD}vmatlas-zram status${RST}\n"
+printf "  ${BOLD}vmatlas-zram doctor${RST}\n"
+printf "  ${BOLD}sudo vmatlas-zram restart${RST} (for live rebuild)\n\n"

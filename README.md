@@ -1,22 +1,33 @@
 # vmatlas-zram-kit
 
-A ZRAM profile kit for Linux desktops running Android development workloads: Gradle, emulators, browsers, IDEs — everything fighting for RAM at once.
+High-performance, multi-tier ZRAM and Linux VM policy kit tailored for heavy development workstations (Android Studio, Gradle daemons, emulators, compilers, Chromium, LLVM builds, and intensive multitasking).
 
-## What you get
+## Architecture: 5-Stage Adaptive Memory Hierarchy
 
-| Feature | What it does |
-| --- | --- |
-| ZRAM swap | zstd-compressed RAM swap, scaled to your host |
-| VM tuning | swappiness, dirty-write caps, cache pressure — tuned for build I/O |
-| MGLRU | Multi-gen LRU for smarter page reclaim (if your kernel supports it) |
-| Tiered recompression | Cold ZRAM pages re-compressed with deeper zstd for better ratios |
-| Writeback | Cold pages offloaded to a dedicated raw partition on your NVMe |
+Modern memory management on high-throughput Linux systems requires both instant swap-out latency and high compression density over time. `vmatlas-zram-kit` constructs a verified 5-stage memory progression:
 
-Each feature is **individually opt-in** during install. The installer shows your current system state and asks Y/N for every step.
+```text
+RAM  ──►  [Primary] LZ4  ──►  [Tier 1] ZSTD:3  ──►  [Tier 2] ZSTD:9  ──►  [Tier 3] ZSTD:15  ──►  [Backing] NVMe Writeback
+           (Burst latency)    (Idle ~30 mins)      (Idle ~3 hours)      (Idle ~12 hours)        (Resident limit guard)
+```
 
-## Quick start
+| Stage | Algorithm / Target | Policy & Timing | Purpose |
+|---|---|---|---|
+| **Primary** | `lz4` (or `zstd:3`) | Immediate swap-out path | Nanosecond-level latency for bursty memory spikes |
+| **Tier 1 (#1)** | `zstd` level 3 | Pages idle >= 30 mins, max 256 MiB/pass | Fast secondary compaction for dormant allocations |
+| **Tier 2 (#2)** | `zstd` level 9 | Pages idle >= 3 hours, max 128 MiB/pass | High-ratio compaction for sustained background heaps |
+| **Tier 3 (#3)** | `zstd` level 15 | Pages idle >= 12 hours, max 64 MiB/pass | Deep cold-page compression for maximum RAM density |
+| **Writeback** | Dedicated raw NVMe partition | Resident ratio >= 70-85%, guarded 256 MiB | Relieves physical RAM pressure while wear-capped |
 
-Requires: systemd, `zram-generator` (install via your package manager first).
+### Kernel ABI Compatibility & Pre-Initialization
+
+`zram-generator 1.2.1` does not program secondary compression levels correctly (it passes supplemental arguments to `recompress`, triggering kernel `EINVAL`). `vmatlas-zram-kit` resolves this by writing secondary algorithm parameters directly to `/sys/block/zram0/algorithm_params` before initialization (`initstate=0`) via a systemd pre-setup hook, verifying the device post-initialization and publishing `/run/vmatlas-tier/levels`.
+
+---
+
+## Interactive Installation & Setup
+
+Inspired by modern terminal setup tools (such as `dots-hyprland` and `osu-wine`), the installer provides both a guided interactive TUI and fully scriptable CLI flags.
 
 ```bash
 git clone https://github.com/gustarmartins/vmatlas-zram-kit.git
@@ -24,171 +35,126 @@ cd vmatlas-zram-kit
 ./install.sh
 ```
 
-The installer walks you through each step interactively. To auto-accept defaults:
+### Key Installer Features:
 
-```bash
-./install.sh -y
-```
+1. **Interactive Sizing Picker**:
+   - **Workstation & Dev Baseline (Recommended for 16GB)**: `ram * 2.25` virtual ZRAM (~36 GiB on 16GB RAM), resident limit `ram / 1.6` (~10 GiB RAM cap), swap priority 90.
+   - **Aggressive / Build Storm**: `ram * 2.50` virtual ZRAM (~40 GiB), resident limit `ram / 1.5` (~10.6 GiB cap).
+   - **Balanced Standard**: `ram * 2.00` virtual ZRAM (~32 GiB), resident limit `ram / 2.0` (~8.0 GiB cap).
+   - **Safe Conservative**: `min(ram * 2, 32 GiB)`, resident limit `ram / 2`.
+   - **Custom Expression**: Specify your own formulas.
 
-To apply immediately without rebooting:
+2. **Compression Pipeline Selection**:
+   - 4-Stage Hierarchy (LZ4 -> ZSTD:3 -> ZSTD:9 -> ZSTD:15)
+   - 3-Stage Hierarchy (LZ4 -> ZSTD:3 -> ZSTD:9)
+   - Single-Stage ZSTD (ZSTD:3)
+   - Custom parameters
 
-```bash
-./install.sh --apply-now
-```
+3. **Best-Effort Guided NVMe Writeback Wizard**:
+   - Automatically scans partitions and discovers candidate SSD/NVMe partitions.
+   - **GPT Partition Type Correction**: Warns if the partition is typed as Linux Swap (which causes `systemd-gpt-auto-generator` to hijack it as conflicting raw swap) and safely retypes it to **Generic Linux Data** (`0fc63daf-8483-4772-8e79-3d69d8477de4`) leaving boundaries and partition layout intact.
+   - Checks for filesystem signatures and safely wipes them upon confirmation.
+   - Uses stable `/dev/disk/by-partuuid/...` identifiers.
 
-## Full profile: tiered compression + writeback
+4. **16GB Workstation Baseline VM Knobs**:
+   - `vm.swappiness = 142`
+   - `vm.vfs_cache_pressure = 68`
+   - `vm.min_free_kbytes = 131072` (128 MiB)
+   - `vm.watermark_scale_factor = 92`
+   - `vm.watermark_boost_factor = 16155`
+   - `vm.page-cluster = 0` (Zero disk readahead latency for ZRAM)
+   - `vm.compaction_proactiveness = 0` (Prevents background compaction micro-stutters)
+   - `vm.compact_unevictable_allowed = 1`
+   - `vm.zone_reclaim_mode = 0`
+   - `vm.dirty_bytes = 1342177280` (~1.25 GiB foreground buffer)
+   - `vm.dirty_background_bytes = 78643200` (~75 MiB background flush threshold)
+   - `vm.dirty_writeback_centisecs = 150` (1.5s background interval)
+   - `vm.dirty_expire_centisecs = 1000` (10s expire interval)
+   - `vm.extfrag_threshold = 250`
+   - `vm.max_map_count = 1048576`
+   - `mglru_enabled = 0x0007`, `mglru_min_ttl_ms = 2000`
 
-This is the end-goal for maximum benefit on Android builds — deeper ZRAM compression for cold pages and NVMe-backed writeback for the coldest ones.
-
-### Step 1: Install the base profile
-
-```bash
-./install.sh
-```
-
-Reboot (or use `--apply-now`), then verify:
-
-```bash
-vmatlas-zram status
-vmatlas-zram preflight
-```
-
-### Step 2: Enable tiered compression
-
-After one successful boot, the installer can verify your kernel supports multi-compressor ZRAM:
-
-```bash
-./install.sh --tiered
-```
-
-This adds a zstd level 12 secondary compressor for idle-page recompression.
-
-### Step 3: Enable writeback
-
-You need a **dedicated, empty, unmounted raw partition** (typically on your NVMe). Find it:
-
-```bash
-lsblk -o NAME,SIZE,FSTYPE,MOUNTPOINTS,TYPE
-```
-
-Pick a partition that shows no FSTYPE and no MOUNTPOINTS. Use its stable path:
-
-```bash
-ls -la /dev/disk/by-partuuid/
-```
-
-Then install with writeback:
-
-```bash
-./install.sh --tiered \
-  --writeback-device /dev/disk/by-partuuid/YOUR-PARTUUID \
-  --confirm-writeback-device
-```
-
-The installer validates the device is safe (empty, unmounted, not active swap, no filesystem). It will reject anything risky.
-
-### Step 4 (optional): Enable automatic cold-page writeback timer
-
-By default writeback is manual. To enable hourly automated passes for pages idle > 24 hours:
-
-```bash
-./install.sh --tiered \
-  --writeback-device /dev/disk/by-partuuid/YOUR-PARTUUID \
-  --confirm-writeback-device \
-  --enable-cold-writeback-timer
-```
-
-### Using recompression and writeback after install
-
-```bash
-# Check status anytime
-vmatlas-zram status
-
-# Manual recompression (requires tiered profile)
-sudo vmatlas-zram recompress idle
-
-# Manual cold-page writeback (requires writeback device)
-sudo vmatlas-zram writeback cold
-```
-
-## Profiles
-
-| Profile | Compression | Writeback | Use case |
-| --- | --- | --- | --- |
-| `android-dev-safe` | zstd level 3 | off | Default baseline |
-| `android-dev-tiered` | zstd 3 + zstd 12 | off | + idle recompression |
-| `android-dev-tiered-writeback` | zstd 3 + zstd 12 | dedicated partition | Full profile |
-
-All profiles scale automatically to your host RAM:
-
-| Host RAM | RAM reserve | Dirty bg/fg | MGLRU TTL |
-| --- | ---: | ---: | ---: |
-| ≤ 8 GiB | 64 MiB | 32 / 128 MiB | 1000 ms |
-| 9–32 GiB | 128 MiB | 64 / 256 MiB | 2000 ms |
-| > 32 GiB | 128 MiB | 128 / 512 MiB | 2000 ms |
-
-ZRAM virtual size is `min(ram × 2, 32 GiB)` with a resident cap of `ram / 2`.
-
-## Uninstall
-
-```bash
-sudo ./uninstall.sh
-# Reboot when convenient
-```
-
-Removes only kit-owned files. Does not touch live ZRAM or active swap.
+5. **Live Restart & Verification**:
+   - Rebuilds and verifies the live ZRAM device, secondary tiers, writeback locks, and VM sysctls without rebooting.
 
 ---
 
-## Additional topics
+## CLI Management & Telemetry (`vmatlas-zram`)
 
-### What it installs
-
-```
-/etc/systemd/zram-generator.conf.d/90-vmatlas-zram.conf
-/etc/sysctl.d/90-vmatlas-zram.conf
-/etc/vmatlas-zram/
-/etc/systemd/system/vmatlas-zram-mglru.service
-/usr/local/bin/vmatlas-zram
-/usr/local/libexec/vmatlas-zram-mglru
-/usr/local/libexec/vmatlas-zram-process
-```
-
-### Process memory controls
-
-Target-scoped helpers to page out or warm individual processes you own:
+The kit includes a unified command-line tool `vmatlas-zram` for operational control, health verification, and diagnostics:
 
 ```bash
-vmatlas-zram process inspect PID
-vmatlas-zram process pageout PID --dry-run
-vmatlas-zram process pageout PID
-vmatlas-zram process warm PID --dry-run
-vmatlas-zram process warm PID
+# Check live memory hierarchy, compression ratios, and writeback state
+vmatlas-zram status
+
+# Run system diagnostic and preflight integrity check
+vmatlas-zram doctor
+
+# Trigger manual tier recompression
+sudo vmatlas-zram recompress tier1
+sudo vmatlas-zram recompress tier2
+sudo vmatlas-zram recompress tier3
+sudo vmatlas-zram recompress all
+
+# Trigger guarded NVMe writeback pass
+sudo vmatlas-zram writeback cold
+sudo vmatlas-zram writeback emergency
+
+# Live restart & rebuild the stack without rebooting
+sudo vmatlas-zram restart
+sudo vmatlas-zram restart --force
+
+# Compact physical memory and ZRAM allocator pools
+sudo vmatlas-zram compact
+
+# Drop clean caches safely
+sudo vmatlas-zram drop-caches
+
+# Scoped memory inspection or pageout for a specific target process
+vmatlas-zram process inspect <PID>
+vmatlas-zram process pageout <PID> --dry-run
 ```
 
-These are single-PID, caller-owned operations — not global swap controls. See [docs/OPERATIONS.md](docs/OPERATIONS.md).
+---
 
-### Safety model
+## Unattended / Scriptable Installation
 
-The installer refuses unsafe conditions: missing systemd, missing zram-generator, existing unrecognized ZRAM configs, writeback to non-dedicated partitions, live ZRAM resets. It never runs `swapoff`, removes disk swap, or reboots automatically. Full details in [docs/SAFETY.md](docs/SAFETY.md).
-
-### Dry run
-
-Preview everything without changing your system:
+For automated deployment, pass arguments directly:
 
 ```bash
-./install.sh --dry-run
-./install.sh --tiered --dry-run
+./install.sh --non-interactive \
+  --size "ram * 2.25" \
+  --resident-limit "ram / 1.6" \
+  --tiers 4 \
+  --writeback-device "/dev/disk/by-partuuid/01767f33-8e7e-4ef7-ac65-0e63f34836e5" \
+  --confirm-writeback-device \
+  --retype-swap-partition \
+  --live-restart
 ```
 
-### Real-world data
+---
 
-The source machine's two-day snapshot: 13.87 GiB stored in ZRAM using 4.38 GiB RAM (3.17× reduction), with 3.79 GiB on a dedicated NVMe backing device. See [docs/REAL-WORLD-SNAPSHOT.md](docs/REAL-WORLD-SNAPSHOT.md).
+## Uninstallation
 
-### Why ZRAM is not magic
+To cleanly remove all kit drop-ins, services, and configuration files:
 
-ZRAM is compressed RAM, not extra physical memory. Compression ratios, CPU cost, and the point where swap becomes painful depend on your workload and machine. Treat this as a tested starting point, validate with your builds, and keep the rollback command handy.
+```bash
+sudo ./uninstall.sh
+```
+
+---
+
+## Documentation
+
+- [Profiles and Scaled Knobs](docs/PROFILES.md)
+- [Operational Controls & Process Helper](docs/OPERATIONS.md)
+- [Writeback Architecture & Wear Budgets](docs/WRITEBACK.md)
+- [Safety Boundaries & Design Rules](docs/SAFETY.md)
+- [Validation & Verification](docs/VALIDATION.md)
+- [Real-World Workstation Snapshot](docs/REAL-WORLD-SNAPSHOT.md)
+- [Frequently Asked Questions (FAQ)](docs/FAQ.md)
+- [Kernel & Generator References](docs/REFERENCES.md)
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT License. See [LICENSE](LICENSE).
