@@ -190,7 +190,7 @@ launch_vm() {
     if [ "$DISPLAY_MODE" = "nographic" ]; then
         qemu_display=(-nographic -serial mon:stdio)
     else
-        qemu_display=(-display gtk,gl=on -device virtio-vga-gl)
+        qemu_display=(-display "gtk,gl=on" -device virtio-vga-gl)
     fi
 
     cat <<EOF

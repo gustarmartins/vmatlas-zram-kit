@@ -6,8 +6,6 @@
 set -Eeuo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
-SELF="$SCRIPT_DIR/install.sh"
-ORIGINAL_ARGS=("$@")
 
 # Terminal styling & colors
 if [ -t 1 ]; then
@@ -18,10 +16,9 @@ if [ -t 1 ]; then
     GREEN=$'\033[32m'
     YELLOW=$'\033[33m'
     RED=$'\033[31m'
-    MAGENTA=$'\033[35m'
     RST=$'\033[0m'
 else
-    BOLD='' DIM='' BLUE='' CYAN='' GREEN='' YELLOW='' RED='' MAGENTA='' RST=''
+    BOLD='' DIM='' BLUE='' CYAN='' GREEN='' YELLOW='' RED='' RST=''
 fi
 
 # Global defaults
@@ -57,7 +54,6 @@ TIER3_LEVEL="15"
 
 # Writeback defaults
 WRITEBACK_DEVICE=""
-CONFIRM_WRITEBACK=0
 COLD_PASS_MIB=256
 BOOT_CAP_MIB=4096
 EMERGENCY_CAP_MIB=1024
@@ -82,12 +78,12 @@ MAX_MAP_COUNT=1048576
 MGLRU_TTL=2000
 
 # Helper functions
-info()    { printf "${CYAN}[*] %s${RST}\n" "$*"; }
-success() { printf "${GREEN}[+] %s${RST}\n" "$*"; }
-warn()    { printf "${YELLOW}[!] WARNING: %s${RST}\n" "$*"; }
-err()     { printf "${RED}[-] ERROR: %s${RST}\n" "$*"; }
+info()    { printf "%b[*] %s%b\n" "$CYAN" "$*" "$RST"; }
+success() { printf "%b[+] %s%b\n" "$GREEN" "$*" "$RST"; }
+warn()    { printf "%b[!] WARNING: %s%b\n" "$YELLOW" "$*" "$RST"; }
+err()     { printf "%b[-] ERROR: %s%b\n" "$RED" "$*" "$RST"; }
 die()     { err "$*"; exit 1; }
-step()    { printf "\n${BOLD}${BLUE}>>> %s${RST}\n" "$*"; }
+step()    { printf "\n%b>>> %s%b\n" "$BOLD$BLUE" "$*" "$RST"; }
 
 print_banner() {
     cat <<EOF
@@ -153,7 +149,7 @@ while [ "$#" -gt 0 ]; do
         --primary-algo) PRIMARY_ALGO="${2:-lz4}"; shift 2 ;;
         --primary-level) PRIMARY_LEVEL="${2:-}"; shift 2 ;;
         --writeback-device) WRITEBACK_DEVICE="${2:-}"; shift 2 ;;
-        --confirm-writeback-device) CONFIRM_WRITEBACK=1; shift ;;
+        --confirm-writeback-device) shift ;;
         --retype-swap-partition) RETYPE_SWAP=1; shift ;;
         --swappiness) SWAPPINESS="${2:-142}"; shift 2 ;;
         --vfs-cache-pressure) VFS_CACHE_PRESSURE="${2:-68}"; shift 2 ;;
@@ -194,7 +190,10 @@ check_dependencies() {
     # Check zram-generator
     local gen_found=0
     for cand in /usr/lib/systemd/system-generators/zram-generator /usr/libexec/systemd/system-generators/zram-generator; do
-        [ -x "$cand" ] && gen_found=1 && break
+        if [ -x "$cand" ]; then
+            gen_found=1
+            break
+        fi
     done
     if [ "$gen_found" -eq 0 ] && ! command -v zram-generator >/dev/null 2>&1; then
         missing+=("zram-generator")
@@ -204,7 +203,7 @@ check_dependencies() {
         warn "Missing required packages: ${missing[*]}"
         if [ "$DISTRO" = "arch" ]; then
             if [ "$INTERACTIVE" -eq 1 ]; then
-                printf "${BOLD}Install missing packages using pacman now? [Y/n]: ${RST}"
+                printf '%s' "${BOLD}Install missing packages using pacman now? [Y/n]: ${RST}"
                 read -r reply
                 if [[ ! "$reply" =~ ^[Nn] ]]; then
                     sudo pacman -S --needed --noconfirm "${missing[@]}" || die "failed to install dependencies with pacman"
@@ -221,6 +220,15 @@ check_dependencies() {
     success "All prerequisite packages are installed."
 }
 
+# Check existing local config unless adopting
+check_existing_config() {
+    if [ "$ADOPT_LOCAL_CONFIG" -eq 0 ]; then
+        if [ -f /etc/systemd/zram-generator.conf ] && ! grep -Fqs "vmatlas-zram" /etc/systemd/zram-generator.conf; then
+            warn "Local configuration exists at /etc/systemd/zram-generator.conf (pass --adopt-local-zram-config to adopt)."
+        fi
+    fi
+}
+
 # Inspect kernel capabilities
 check_kernel_capabilities() {
     step "Inspecting Kernel Multi-Compressor & ZRAM Capabilities"
@@ -232,10 +240,8 @@ check_kernel_capabilities() {
         sudo modprobe zram num_devices=1 2>/dev/null || true
     fi
 
-    local multi_support=0
     if [ -d "$z" ]; then
         if [ -e "$z/recomp_algorithm" ] && [ -e "$z/recompress" ] && [ -e "$z/algorithm_params" ]; then
-            multi_support=1
             success "Kernel multi-compressor recompression ABI verified (recomp_algorithm, algorithm_params, recompress)."
         else
             warn "Running kernel lacks multi-compressor ABI (algorithm_params or recomp_algorithm missing)."
@@ -288,7 +294,7 @@ autoscale_vm_knobs() {
 # Wizard: Sizing Selection
 wizard_sizing() {
     step "Step 1: ZRAM Sizing & Allocation Strategy"
-    printf "Detected Host RAM: ${BOLD}${GREEN}%s GiB${RST} (${RAM_MIB} MiB)\n\n" "$RAM_GIB_CALC"
+    printf "Detected Host RAM: %b%s GiB%b (%s MiB)\n\n" "$BOLD$GREEN" "$RAM_GIB_CALC" "$RST" "$RAM_MIB"
     
     local s1_size="ram * 2.25"
     local s1_res="ram / 1.6"
@@ -321,7 +327,7 @@ Select your ZRAM Sizing Preset:
      -> Enter custom sizing and resident limit formulas
 EOF
 
-    printf "\n${BOLD}Select option [1-5, Default 1]: ${RST}"
+    printf '\n%s' "${BOLD}Select option [1-5, Default 1]: ${RST}"
     read -r choice
     case "${choice:-1}" in
         1)
@@ -444,7 +450,7 @@ Requirements:
     (If typed as Linux Swap, systemd-gpt-auto-generator will hijack it as ordinary disk swap).
 EOF
 
-    printf "\n${BOLD}Do you want to configure an SSD/NVMe writeback backing partition? [y/N]: ${RST}"
+    printf '\n%s' "${BOLD}Do you want to configure an SSD/NVMe writeback backing partition? [y/N]: ${RST}"
     read -r enable_wb
     if [[ ! "$enable_wb" =~ ^[Yy] ]]; then
         WRITEBACK_DEVICE=""
@@ -452,8 +458,7 @@ EOF
         return 0
     fi
 
-    printf "\n${CYAN}Scanning available block partitions...${RST}\n"
-    local raw_parts=()
+    printf '\n%s\n' "${CYAN}Scanning available block partitions...${RST}"
     local part_uuids=()
     local part_paths=()
     local part_types=()
@@ -481,7 +486,6 @@ EOF
         read -r custom_path
         if [ -n "$custom_path" ]; then
             WRITEBACK_DEVICE="$custom_path"
-            CONFIRM_WRITEBACK=1
         fi
         return 0
     fi
@@ -499,13 +503,11 @@ EOF
         0)
             printf "Enter full /dev/disk/by-* path: "
             read -r WRITEBACK_DEVICE
-            CONFIRM_WRITEBACK=1
             ;;
         *)
             if [[ "$sel" =~ ^[0-9]+$ ]] && [ "$sel" -ge 1 ] && [ "$sel" -le "${#part_paths[@]}" ]; then
                 local idx=$((sel - 1))
                 WRITEBACK_DEVICE="${part_paths[$idx]}"
-                CONFIRM_WRITEBACK=1
             else
                 warn "Invalid selection. Skipping writeback."
                 WRITEBACK_DEVICE=""
@@ -543,7 +545,7 @@ EOF
         if [[ "$gpt_type" =~ ^[0-9a-fA-F-]*0657FD6D ]] || [[ "$gpt_type" =~ ^0657fd6d ]]; then
             warn "Partition is currently typed as 'Linux swap' ($gpt_type)."
             printf "systemd-gpt-auto-generator will claim this as ordinary swap at boot, conflicting with ZRAM!\n"
-            printf "${BOLD}Would you like the installer to safely retype it to 'Generic Linux Data' (0fc63daf-8483-4772-8e79-3d69d8477de4)? [Y/n]: ${RST}"
+            printf '%s' "${BOLD}Would you like the installer to safely retype it to 'Generic Linux Data' (0fc63daf-8483-4772-8e79-3d69d8477de4)? [Y/n]: ${RST}"
             read -r retype_ans
             if [[ ! "$retype_ans" =~ ^[Nn] ]]; then
                 RETYPE_SWAP=1
@@ -555,7 +557,7 @@ EOF
         sigs=$(wipefs -n --noheadings "$resolved" 2>/dev/null || true)
         if [ -n "$sigs" ]; then
             warn "Filesystem signatures detected on $WRITEBACK_DEVICE ($sigs)."
-            printf "${BOLD}Wipe signatures now to prepare as dedicated raw backing store? [y/N]: ${RST}"
+            printf '%s' "${BOLD}Wipe signatures now to prepare as dedicated raw backing store? [y/N]: ${RST}"
             read -r wipe_ans
             if [[ "$wipe_ans" =~ ^[Yy] ]]; then
                 sudo wipefs -a "$resolved" || warn "wipefs returned non-zero"
@@ -650,7 +652,8 @@ stage_and_install() {
     step "Staging Configuration Files & Installing System Services"
 
     # Backup existing configurations
-    local backup_dir="/var/backups/vmatlas-zram-$(date +%Y%m%d-%H%M%S)"
+    local backup_dir
+    backup_dir="/var/backups/vmatlas-zram-$(date +%Y%m%d-%H%M%S)"
     sudo install -d -m 0755 "$backup_dir"
     for f in /etc/systemd/zram-generator.conf \
              /etc/systemd/zram-generator.conf.d/90-vmatlas-zram.conf \
@@ -793,6 +796,7 @@ EOF
 print_banner
 detect_distro
 check_dependencies
+check_existing_config
 check_kernel_capabilities
 
 if [ "$INTERACTIVE" -eq 1 ]; then
@@ -812,7 +816,7 @@ if [ "$DRY_RUN" -eq 1 ]; then
 fi
 
 if [ "$INTERACTIVE" -eq 1 ]; then
-    printf "\n${BOLD}Proceed with installation to system? [Y/n]: ${RST}"
+    printf '\n%s' "${BOLD}Proceed with installation to system? [Y/n]: ${RST}"
     read -r proceed_ans
     if [[ "$proceed_ans" =~ ^[Nn] ]]; then
         info "Installation cancelled by user."
@@ -827,7 +831,7 @@ if [ "$LIVE_RESTART" -eq 1 ] || [ "$INTERACTIVE" -eq 1 ]; then
     if [ "$LIVE_RESTART" -eq 1 ]; then
         do_restart=1
     else
-        printf "\n${BOLD}Would you like to live-rebuild and verify the ZRAM stack immediately without rebooting? [y/N]: ${RST}"
+        printf '\n%s' "${BOLD}Would you like to live-rebuild and verify the ZRAM stack immediately without rebooting? [y/N]: ${RST}"
         read -r restart_ans
         [[ "$restart_ans" =~ ^[Yy] ]] && do_restart=1 || do_restart=0
     fi
@@ -845,9 +849,9 @@ if [ "$LIVE_RESTART" -eq 1 ] || [ "$INTERACTIVE" -eq 1 ]; then
     fi
 fi
 
-printf "\n${GREEN}${BOLD}Setup completed successfully!${RST}\n"
+printf '\n%s\n' "${GREEN}${BOLD}Setup completed successfully!${RST}"
 printf "Configuration will automatically take effect on the next boot.\n"
 printf "To inspect or manage your ZRAM stack at any time, run:\n"
-printf "  ${BOLD}vmatlas-zram status${RST}\n"
-printf "  ${BOLD}vmatlas-zram doctor${RST}\n"
-printf "  ${BOLD}sudo vmatlas-zram restart${RST} (for live rebuild)\n\n"
+printf '  %s\n' "${BOLD}vmatlas-zram status${RST}"
+printf '  %s\n' "${BOLD}vmatlas-zram doctor${RST}"
+printf '  %s\n\n' "${BOLD}sudo vmatlas-zram restart${RST} (for live rebuild)"

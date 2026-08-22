@@ -9,6 +9,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get update && sudo apt-get install -y shellcheck
-      - run: ./tests/test-syntax.sh
-      - run: shellcheck install.sh uninstall.sh bin/vmatlas-zram libexec/vmatlas-zram-mglru tests/test-syntax.sh
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y shellcheck python3
+      - name: Run syntax tests
+        run: ./tests/test-syntax.sh
+      - name: Run ShellCheck
+        run: shellcheck install.sh uninstall.sh bin/vmatlas-zram libexec/vmatlas-zram-tier-init libexec/vmatlas-zram-tier-manager libexec/vmatlas-zram-mglru tests/test-syntax.sh tests/vm/launch-test-vm.sh

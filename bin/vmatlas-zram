@@ -9,12 +9,7 @@ LEVELS_FILE=$STATE_DIR/levels
 STATE_FILE=$STATE_DIR/state
 WB_STATE=$STATE_DIR/writeback_pages
 LOCK_FILE=/run/lock/vmatlas-zram-tier.lock
-PROFILE_FILE=/etc/vmatlas-zram/profile.env
-WRITEBACK_FILE=/etc/vmatlas-zram/writeback.env
-TIERS_FILE=/etc/vmatlas-zram/tiers.conf
-FALLBACK_TIERS_FILE=/etc/vmatlas/zram-tiers.conf
 PROCESS_HELPER=/usr/local/libexec/vmatlas-zram-process
-TIER_INIT_HELPER=/usr/local/libexec/vmatlas-zram-tier-init
 
 die() { printf 'vmatlas-zram: %s\n' "$*" >&2; exit 1; }
 warn() { printf 'vmatlas-zram: WARNING: %s\n' "$*" >&2; }
@@ -298,7 +293,7 @@ recompress() {
 }
 
 writeback() {
-    local mode=${1:-cold} confirmation=${2:-}
+    local mode=${1:-cold}
     local pass_mib=256 cap_mib=4096 idle_age=1800 before_written after_written before_boot remaining_pages pass_pages before after rc=0
     need_root
     require_zram
@@ -387,7 +382,7 @@ writeback() {
 }
 
 restart() {
-    local force=0 mem_avail swap_used required timer_active=0
+    local force=0 mem_avail swap_used required
     need_root
     acquire_lock
 

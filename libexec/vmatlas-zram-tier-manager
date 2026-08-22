@@ -54,7 +54,7 @@ if ! { [ "${VMATLAS_LOCK_HELD:-0}" = 1 ] && [ -e /proc/$$/fd/9 ] && [ "$(readlin
     flock -n 9 || { log_msg "action=skip reason=another_tier_action_in_progress"; exit 0; }
 fi
 
-read -r z_orig z_compr z_used z_limit _z_peak _z_same _z_compacted z_huge _ <"$ZRAM/mm_stat"
+read -r _z_orig _z_compr z_used z_limit _z_peak _z_same _z_compacted z_huge _ <"$ZRAM/mm_stat"
 read -r _z_bd_count _z_bd_reads z_bd_writes <"$ZRAM/bd_stat"
 backing=$(cat "$ZRAM/backing_dev" 2>/dev/null || echo none)
 
